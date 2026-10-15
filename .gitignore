@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+logs/
+.tmp/
+
+# Python IDEs
+.idea/
+.history/
+
+# Local model files
+ollama_data/
+models/
+
+# Generated RFP processing files
+data/s3_test/
+chunks/
+
+
+
+# Tender documents and generated data
+data/
+llm_results.json
+tables.json
+request.json
