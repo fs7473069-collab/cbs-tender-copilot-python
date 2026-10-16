@@ -6,31 +6,31 @@ The service processes tender documents, extracts structured requirements, and in
 
 ## Architecture
 
-The current MVP follows:
+The current MVP follows this flow:
 
 ```text
 Java Backend
-     |
-     +--> S3 / Object Storage
-     |       |
-     |       +--> Tender Document
-     |
-     +--> RabbitMQ
-             |
-             v
+    |
+    +--> S3 / Object Storage
+    |       |
+    |       +--> Tender Document
+    |
+    +--> RabbitMQ
+            |
+            v
       Python Document Service
-             |
-             +--> PDF / DOCX extraction
-             +--> Table extraction
-             +--> Chunking
-             +--> Qwen3 8B via Ollama
-             +--> Requirement validation
-             |
-             v
-          RabbitMQ
-             |
-             v
-        Java Backend
+            |
+            +--> PDF / DOCX extraction
+            +--> Table extraction
+            +--> Chunking
+            +--> Qwen3 8B via Ollama
+            +--> Requirement validation
+            |
+            v
+         RabbitMQ
+            |
+            v
+       Java Backend
 ```
 
 Java stores the tender file in S3 and sends a document reference over RabbitMQ. Python downloads the file, extracts text, chunks it, runs Qwen3 8B locally through Ollama, and returns structured requirements.
@@ -74,17 +74,17 @@ app/
   messaging/      RabbitMQ connection, consumer, publisher
   storage/        S3 download
 
-data/             Sample PDF and S3 test downloads
-chunks/           Saved chunks and requirement JSON
+data/              Sample PDF and S3 test downloads
+chunks/            Saved chunks and requirement JSON
 
 tests/
   test_document_processing.py
   test_response_builder.py
   test_consumer.py
 
-pipeline.py       DOCX -> chunks -> Qwen3 8B -> JSON
-main.py           Local PDF extraction smoke test
-requirements.txt  Python dependencies
+pipeline.py        DOCX -> chunks -> Qwen3 8B -> JSON
+main.py            Local PDF extraction smoke test
+requirements.txt   Python dependencies
 ```
 
 ## Setup
