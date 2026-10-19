@@ -5,7 +5,7 @@ import pika
 from app.messaging.rabbitmq import create_connection
 
 
-RESPONSE_QUEUE = "rfp-python-response-test"
+RESPONSE_QUEUE = "rfp_docs_response"
 
 
 def publish_message(message):
