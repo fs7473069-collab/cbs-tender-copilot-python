@@ -1,52 +1,59 @@
+"""
+DOCX text extractor — Linux-compatible replacement.
 
-import os
-import tempfile
+The original implementation used win32com to convert DOCX → PDF via
+Microsoft Word on Windows and then reused the PDF extractor for
+accurate page numbers. On Linux we extract text directly from the DOCX
+using python-docx, assigning page breaks to synthetic page boundaries.
+"""
 
-import win32com.client
-
-from app.document.pdf_processor import extract_pdf_text
+from docx import Document
 
 
 def extract_docx_text(docx_path):
-    word = None
-    document = None
-    temp_pdf = None
+    """
+    Extract text from a DOCX file, returning a list of page dicts that
+    match the format produced by extract_pdf_text:
 
-    try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".pdf",
-            delete=False,
-        ) as temp_file:
-            temp_pdf = temp_file.name
+        [{"page": <int>, "text": <str>}, ...]
 
-        word = win32com.client.DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
+    Page boundaries are inferred from explicit page-break runs inside
+    the document; if none are present, the whole document is returned
+    as a single page.
+    """
+    doc = Document(docx_path)
+    pages = []
+    current_page = 1
+    current_lines = []
 
-        document = word.Documents.Open(
-            os.path.abspath(docx_path),
-            ReadOnly=True,
-            AddToRecentFiles=False,
+    for para in doc.paragraphs:
+        # Check each run for a page-break character.
+        has_page_break = any(
+            "\f" in (run.text or "") or run._r.xml.find("w:lastRenderedPageBreak") != -1
+            for run in para.runs
         )
 
-        # Export the document using Word's actual page layout.
-        document.ExportAsFixedFormat(
-            OutputFileName=temp_pdf,
-            ExportFormat=17,  # PDF
-        )
+        text = para.text.strip()
+        if text:
+            current_lines.append(text)
 
-        document.Close(False)
-        document = None
+        if has_page_break:
+            pages.append({
+                "page": current_page,
+                "text": "\n".join(current_lines),
+            })
+            current_page += 1
+            current_lines = []
 
-        # Extract text with the correct rendered page numbers.
-        return extract_pdf_text(temp_pdf)
+    # Flush remaining text as the last page.
+    if current_lines:
+        pages.append({
+            "page": current_page,
+            "text": "\n".join(current_lines),
+        })
 
-    finally:
-        if document is not None:
-            document.Close(False)
+    # Guarantee at least one page entry even for empty documents.
+    if not pages:
+        pages.append({"page": 1, "text": ""})
 
-        if word is not None:
-            word.Quit()
-
-        if temp_pdf and os.path.exists(temp_pdf):
-            os.remove(temp_pdf)
+    return pages
