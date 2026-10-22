@@ -43,3 +43,7 @@ data/
 llm_results.json
 tables.json
 request.json
+
+# Local test artifacts
+response.json
+test_saved_response.py

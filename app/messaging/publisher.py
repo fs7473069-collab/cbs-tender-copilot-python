@@ -1,9 +1,7 @@
-
 import json
 import pika
 
 from app.messaging.rabbitmq import create_connection
-
 
 RESPONSE_QUEUE = "rfp_docs_response"
 
@@ -14,14 +12,14 @@ def publish_message(message):
     try:
         channel = connection.channel()
 
-        # Create the test queue if it does not exist.
         channel.queue_declare(
             queue=RESPONSE_QUEUE,
             durable=True,
         )
 
-        # Publish directly to the test queue using RabbitMQ's default exchange.
-        channel.basic_publish(
+        channel.confirm_delivery()
+
+        confirmed = channel.basic_publish(
             exchange="",
             routing_key=RESPONSE_QUEUE,
             body=json.dumps(message, ensure_ascii=False),
@@ -30,7 +28,20 @@ def publish_message(message):
                 content_encoding="utf-8",
                 delivery_mode=2,
             ),
+            mandatory=True,
         )
 
+        print(f"Publish result: {confirmed!r}")
+        print(f"Publish call completed for queue: {RESPONSE_QUEUE}")
+
+    except pika.exceptions.UnroutableError as exc:
+        print(f"Message could not be routed: {exc}")
+        raise
+
+    except pika.exceptions.NackError as exc:
+        print(f"RabbitMQ rejected the message: {exc}")
+        raise
+
     finally:
-        connection.close()
+        if connection.is_open:
+            connection.close()
