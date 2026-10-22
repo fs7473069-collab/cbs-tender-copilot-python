@@ -1,20 +1,62 @@
 
 import json
+from datetime import datetime
 from unittest.mock import Mock, patch
 
-from app.messaging.consumer import callback
+import pytest
+
+import app.messaging.consumer as consumer
+from app.messaging.consumer import _log_inbound_body, callback
+
+
+@pytest.fixture(autouse=True)
+def debug_response_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        consumer,
+        "DEBUG_RESPONSE_PATH",
+        tmp_path / "actual_response.json",
+    )
+
+
+def test_log_inbound_body_reports_bytes_and_requirement_count(capsys):
+    payload = {
+        "eventType": "RFP_ANALYSIS_COMPLETED",
+        "jobId": "job-1",
+        "eventId": "event-1",
+        "result": {"requirements": [{}, {}, {}]},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    message = _log_inbound_body(body)
+    captured = capsys.readouterr().out
+
+    assert message["jobId"] == "job-1"
+    assert "Raw received body length (bytes): %s" % len(body) in captured
+    assert "result.requirements count: 3" in captured
+    assert "The same designs are available" not in captured
+    assert json.dumps(payload) not in captured
 
 
 def make_message():
     return {
         "organizationId": "constell-dev",
+        "workspaceId": "workspace-123",
+        "jobId": "job-123",
+        "analysisId": "analysis-123",
+        "correlationId": "correlation-123",
         "documents": [
             {
                 "documentId": "document-123",
                 "filename": "tender.docx",
                 "bucket": "test-bucket",
                 "key": "tender.docx",
-            }
+            },
+            {
+                "documentId": "document-456",
+                "filename": "unprocessed.docx",
+                "bucket": "test-bucket",
+                "key": "unprocessed.docx",
+            },
         ],
     }
 
@@ -55,8 +97,128 @@ def test_successful_processing_acknowledges_request(
     mock_download.assert_called_once()
     mock_process.assert_called_once()
     mock_publish.assert_called_once()
+    status_event = mock_publish.call_args.args[0]
+
+    assert set(status_event) == {
+        "schemaVersion",
+        "eventType",
+        "eventId",
+        "organizationId",
+        "workspaceId",
+        "jobId",
+        "analysisId",
+        "correlationId",
+        "attempt",
+        "status",
+        "completedAt",
+        "documents",
+        "error",
+    }
+    assert status_event["schemaVersion"] == "1.0"
+    assert status_event["eventType"] == "RFP_ANALYSIS_STATUS"
+    assert status_event["organizationId"] == "constell-dev"
+    assert status_event["workspaceId"] == "workspace-123"
+    assert status_event["jobId"] == "job-123"
+    assert status_event["analysisId"] == "analysis-123"
+    assert status_event["correlationId"] == "correlation-123"
+    assert status_event["attempt"] == 1
+    assert status_event["status"] == "COMPLETED"
+    assert status_event["error"] is None
+    assert status_event["documents"] == [
+        {
+            "documentId": "document-123",
+            "status": "COMPLETED",
+            "error": None,
+        }
+    ]
+    assert "result" not in status_event
+    assert "requirements" not in status_event
+    assert "Three-year warranty required" not in json.dumps(status_event)
+    assert status_event["eventId"]
+    datetime.fromisoformat(status_event["completedAt"].replace("Z", "+00:00"))
     channel.basic_ack.assert_called_once_with(delivery_tag=10)
     channel.basic_nack.assert_not_called()
+
+
+@patch("app.messaging.consumer.publish_message")
+@patch("app.messaging.consumer.process_tender_document")
+@patch("app.messaging.consumer.download_file")
+def test_status_event_uses_inbound_attempt(
+    mock_download, mock_process, mock_publish
+):
+    channel = make_channel()
+    method = Mock()
+    method.delivery_tag = 16
+    method.redelivered = False
+    message = make_message()
+    message["attempt"] = 3
+
+    callback(
+        channel,
+        method,
+        Mock(),
+        json.dumps(message).encode("utf-8"),
+    )
+
+    assert mock_publish.call_args.args[0]["attempt"] == 3
+    channel.basic_ack.assert_called_once_with(delivery_tag=16)
+
+
+@patch("app.messaging.consumer.publish_message")
+@patch("app.messaging.consumer.process_tender_document")
+@patch("app.messaging.consumer.download_file")
+def test_missing_status_ids_requeues_without_publishing_or_acknowledging(
+    mock_download, mock_process, mock_publish
+):
+    channel = make_channel()
+    method = Mock()
+    method.delivery_tag = 14
+    method.redelivered = False
+    message = make_message()
+    del message["analysisId"]
+
+    callback(
+        channel,
+        method,
+        Mock(),
+        json.dumps(message).encode("utf-8"),
+    )
+
+    mock_download.assert_called_once()
+    mock_process.assert_called_once()
+    mock_publish.assert_not_called()
+    channel.basic_ack.assert_not_called()
+    channel.basic_nack.assert_called_once_with(
+        delivery_tag=14,
+        requeue=True,
+    )
+
+
+@patch("app.messaging.consumer.publish_message")
+@patch("app.messaging.consumer.process_tender_document")
+@patch("app.messaging.consumer.download_file")
+def test_publish_failure_does_not_acknowledge_request(
+    mock_download, mock_process, mock_publish
+):
+    channel = make_channel()
+    method = Mock()
+    method.delivery_tag = 15
+    method.redelivered = False
+    mock_publish.side_effect = RuntimeError("Simulated publish failure")
+
+    callback(
+        channel,
+        method,
+        Mock(),
+        json.dumps(make_message()).encode("utf-8"),
+    )
+
+    mock_publish.assert_called_once()
+    channel.basic_ack.assert_not_called()
+    channel.basic_nack.assert_called_once_with(
+        delivery_tag=15,
+        requeue=True,
+    )
 
 
 @patch("app.messaging.consumer.publish_message")
