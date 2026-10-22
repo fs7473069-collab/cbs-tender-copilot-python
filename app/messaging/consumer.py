@@ -7,7 +7,7 @@ from pika.exceptions import AMQPError
 
 from app.messaging.rabbitmq import create_connection
 from app.storage.s3_client import download_file
-from pipeline import process_document
+from app.orchestration.service import process_tender_document
 from app.response.response_builder import build_completed_response
 from app.messaging.publisher import publish_message
 
@@ -53,7 +53,7 @@ def callback(ch, method, properties, body):
 
         print("\nProcessing document with the existing pipeline...")
 
-        requirements = process_document(local_path)
+        requirements = process_tender_document(local_path)
 
         print(f"Extracted {len(requirements)} requirements")
 

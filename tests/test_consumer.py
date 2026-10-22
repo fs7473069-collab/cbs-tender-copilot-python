@@ -26,7 +26,7 @@ def make_channel():
 
 
 @patch("app.messaging.consumer.publish_message")
-@patch("app.messaging.consumer.process_document")
+@patch("app.messaging.consumer.process_tender_document")
 @patch("app.messaging.consumer.download_file")
 def test_successful_processing_acknowledges_request(
     mock_download, mock_process, mock_publish
@@ -60,7 +60,7 @@ def test_successful_processing_acknowledges_request(
 
 
 @patch("app.messaging.consumer.publish_message")
-@patch("app.messaging.consumer.process_document")
+@patch("app.messaging.consumer.process_tender_document")
 @patch("app.messaging.consumer.download_file")
 def test_first_failure_requeues_request(
     mock_download, mock_process, mock_publish
@@ -133,3 +133,4 @@ def test_closed_channel_does_not_acknowledge_or_reject():
 
     channel.basic_ack.assert_not_called()
     channel.basic_nack.assert_not_called()
+
