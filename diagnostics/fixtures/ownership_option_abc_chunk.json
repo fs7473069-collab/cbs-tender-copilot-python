@@ -1,0 +1,10 @@
+{
+  "source_document": "data\\sample tender.pdf",
+  "chunk_index_0based": 4,
+  "chunk_index_1based": 5,
+  "page": 2,
+  "source_type": "table",
+  "table_index": 1,
+  "page_reference_type": "actual_pdf_page",
+  "text": "Table headers: Component | Option A (Core) | Option B (+ Pricing\nEngine) | Option C (Full Stack)\nComponent: Customer app (mobile + web)\nUI | Option A (Core): Vendor | Option B (+ Pricing\nEngine): Vendor | Option C (Full Stack): Vendor\nComponent: Operator / admin console UI | Option A (Core): Vendor | Option B (+ Pricing\nEngine): Vendor | Option C (Full Stack): Vendor\nComponent: Pricing & product engine | Option A (Core): Qualiteq | Option B (+ Pricing\nEngine): Vendor | Option C (Full Stack): Vendor\nComponent: Identity & wallet service | Option A (Core): Qualiteq | Option B (+ Pricing\nEngine): Qualiteq | Option C (Full Stack): Qualiteq\nComponent: OCPP / charger middleware | Option A (Core): Qualiteq | Option B (+ Pricing\nEngine): Qualiteq | Option C (Full Stack): Vendor (optional)\nComponent: Payment settlement &\nreconciliation | Option A (Core): Qualiteq | Option B (+ Pricing\nEngine): Qualiteq | Option C (Full Stack): Vendor (optional)\nComponent: Payment checkout UI / SDK\nintegration | Option A (Core): Vendor | Option B (+ Pricing\nEngine): Vendor | Option C (Full Stack): Vendor"
+}

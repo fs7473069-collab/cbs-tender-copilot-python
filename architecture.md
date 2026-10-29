@@ -23,16 +23,16 @@ The architecture is designed to be reusable for different RFP and document-proce
 The current MVP integration uses S3 for document storage and RabbitMQ for communication between the Java backend and Python service.
 
 ```text
-                    Java Backend
+                    Java Backend / upload service
                          |
               Upload tender document
                          |
                          v
                   S3 / Object Storage
                          |
-                         | Document reference
+                         | Document reference on request queue
                          v
-                    RabbitMQ
+              RabbitMQ (RABBITMQ_QUEUE)
                          |
                          | RFP analysis message
                          v
@@ -60,7 +60,8 @@ The current MVP integration uses S3 for document storage and RabbitMQ for commun
                          Validation
                               |
                               v
-                         RabbitMQ
+              RabbitMQ rfp_docs_response1
+                 (RFP_ANALYSIS_COMPLETED)
                               |
                               v
                        Java Backend
@@ -408,9 +409,9 @@ Future source tracking may include:
 
 ## 11. S3 / Object Storage
 
-The Java backend stores tender documents in S3/object storage.
+The Java upload service uploads tender documents to S3/object storage.
 
-Python receives the storage reference rather than the complete document through RabbitMQ.
+Python receives the storage reference (bucket/key) rather than the complete document through RabbitMQ.
 
 Example:
 
@@ -436,11 +437,15 @@ RabbitMQ is used as the messaging layer between Java and Python.
 The current integration pattern is:
 
 ```text
-Java
+Java upload service
   |
-  | RFP analysis request
+  | Upload tender document
   v
-RabbitMQ
+S3
+  |
+  | RFP analysis request (bucket/key reference)
+  v
+RabbitMQ request queue (RABBITMQ_QUEUE)
   |
   v
 Python Consumer
@@ -449,34 +454,45 @@ Python Consumer
 Download document from S3
   |
   v
-Process document
+Process document / run extraction pipeline
   |
   v
-Run LLM
+Build RFP_ANALYSIS_COMPLETED JSON
   |
   v
-Generate structured result
+RabbitMQ rfp_docs_response1
   |
   v
-RabbitMQ
-  |
-  v
-Java
+Java backend
 ```
 
-The production RFP queue is:
+### Request queue
+
+The request queue is configurable through `RABBITMQ_QUEUE`.
+
+Common values:
 
 ```text
-copilot-analysis
+copilot-analysis          # configured integration environment
+rfp-python-test           # consumer code-level fallback when unset; also used historically for isolated tests
 ```
 
-For isolated Python testing, a separate test queue is used:
+### Response queue
+
+Completed analysis responses are published to:
 
 ```text
-rfp-python-test
+rfp_docs_response1
 ```
 
-The test queue prevents development testing from interfering with the production/application analysis queue.
+That name is currently hard-coded in `app/messaging/publisher.py`. Zeeshan has confirmed that the Java backend consumes this queue.
+
+### Current messaging limitations
+
+* The consumer processes only the first document in the request `documents` list.
+* A status companion event may be built but is not published.
+* Failed analysis does not currently publish a dedicated FAILED event.
+* Long-running extraction may be slow on CPU/RAM-constrained deployment VMs.
 
 ---
 
@@ -512,17 +528,17 @@ Result
 The integration flow is:
 
 ```text
-Java
+Java upload service
   |
   +--> S3
   |      |
   |      +--> Tender Document
   |
-  +--> RabbitMQ
+  +--> RabbitMQ request queue (RABBITMQ_QUEUE)
          |
          +--> Python Consumer
                  |
-                 +--> S3 Download
+                 +--> S3 Download (bucket/key from message)
                  |
                  +--> Document Processing
                  |
@@ -530,11 +546,15 @@ Java
                  |
                  +--> Validation
                  |
-                 +--> RabbitMQ Result
+                 +--> RFP_ANALYSIS_COMPLETED
+                 |
+                 +--> rfp_docs_response1
                           |
                           v
-                         Java
+                         Java backend
 ```
+
+This describes the implemented messaging path. It does not claim that full frontend-to-backend acceptance testing has passed.
 
 ---
 
@@ -601,8 +621,11 @@ The following components are currently working:
 * Basic LLM response validation
 * S3 document download
 * RabbitMQ connection
-* RabbitMQ message consumption
-* End-to-end document retrieval through S3 + RabbitMQ
+* RabbitMQ request consumption (`RABBITMQ_QUEUE`)
+* Publishing `RFP_ANALYSIS_COMPLETED` to `rfp_docs_response1`
+* Document retrieval through S3 + RabbitMQ for the first document in a request
+
+Known gaps: status companion events are not published, dedicated FAILED events are not published, multi-document requests are not fully handled, and full frontend-to-backend end-to-end acceptance is not claimed here.
 
 The current focus is the RFP MVP.
 

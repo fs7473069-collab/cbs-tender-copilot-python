@@ -97,45 +97,31 @@ def test_successful_processing_acknowledges_request(
     mock_download.assert_called_once()
     mock_process.assert_called_once()
     mock_publish.assert_called_once()
-    status_event = mock_publish.call_args.args[0]
+    completed = mock_publish.call_args.args[0]
 
-    assert set(status_event) == {
-        "schemaVersion",
-        "eventType",
-        "eventId",
-        "organizationId",
-        "workspaceId",
-        "jobId",
-        "analysisId",
-        "correlationId",
-        "attempt",
-        "status",
-        "completedAt",
-        "documents",
-        "error",
-    }
-    assert status_event["schemaVersion"] == "1.0"
-    assert status_event["eventType"] == "RFP_ANALYSIS_STATUS"
-    assert status_event["organizationId"] == "constell-dev"
-    assert status_event["workspaceId"] == "workspace-123"
-    assert status_event["jobId"] == "job-123"
-    assert status_event["analysisId"] == "analysis-123"
-    assert status_event["correlationId"] == "correlation-123"
-    assert status_event["attempt"] == 1
-    assert status_event["status"] == "COMPLETED"
-    assert status_event["error"] is None
-    assert status_event["documents"] == [
-        {
-            "documentId": "document-123",
-            "status": "COMPLETED",
-            "error": None,
-        }
-    ]
-    assert "result" not in status_event
-    assert "requirements" not in status_event
-    assert "Three-year warranty required" not in json.dumps(status_event)
-    assert status_event["eventId"]
-    datetime.fromisoformat(status_event["completedAt"].replace("Z", "+00:00"))
+    assert completed["schemaVersion"] == "1.0"
+    assert completed["eventType"] == "RFP_ANALYSIS_COMPLETED"
+    assert completed["organizationId"] == "constell-dev"
+    assert completed["workspaceId"] == "workspace-123"
+    assert completed["jobId"] == "job-123"
+    assert completed["analysisId"] == "analysis-123"
+    assert completed["correlationId"] == "correlation-123"
+    assert completed["attempt"] == 1
+    assert completed["status"] == "COMPLETED"
+    assert completed["processedDocumentIds"] == ["document-123", "document-456"]
+    assert completed["result"]["requirements"][0]["content"] == (
+        "Three-year warranty required"
+    )
+    assert completed["result"]["requirements"][0]["mandatory"] is True
+    assert completed["eventId"]
+    datetime.fromisoformat(completed["completedAt"].replace("Z", "+00:00"))
+    # Debug artifact mirrors the published fresh response, not a prior run.
+    saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
+    assert saved["eventType"] == "RFP_ANALYSIS_COMPLETED"
+    assert len(saved["result"]["requirements"]) == 1
+    assert saved["result"]["requirements"][0]["content"] == (
+        "Three-year warranty required"
+    )
     channel.basic_ack.assert_called_once_with(delivery_tag=10)
     channel.basic_nack.assert_not_called()
 
@@ -143,7 +129,7 @@ def test_successful_processing_acknowledges_request(
 @patch("app.messaging.consumer.publish_message")
 @patch("app.messaging.consumer.process_tender_document")
 @patch("app.messaging.consumer.download_file")
-def test_status_event_uses_inbound_attempt(
+def test_completed_response_uses_inbound_attempt(
     mock_download, mock_process, mock_publish
 ):
     channel = make_channel()
@@ -152,6 +138,7 @@ def test_status_event_uses_inbound_attempt(
     method.redelivered = False
     message = make_message()
     message["attempt"] = 3
+    mock_process.return_value = [{"text": "Track vehicles", "mandatory": False}]
 
     callback(
         channel,
@@ -160,8 +147,70 @@ def test_status_event_uses_inbound_attempt(
         json.dumps(message).encode("utf-8"),
     )
 
-    assert mock_publish.call_args.args[0]["attempt"] == 3
+    published = mock_publish.call_args.args[0]
+    assert published["attempt"] == 3
+    assert published["eventType"] == "RFP_ANALYSIS_COMPLETED"
     channel.basic_ack.assert_called_once_with(delivery_tag=16)
+
+
+@patch("app.messaging.consumer.publish_message")
+@patch("app.messaging.consumer.process_tender_document")
+@patch("app.messaging.consumer.download_file")
+def test_published_response_uses_fresh_extraction_not_stale_debug_file(
+    mock_download, mock_process, mock_publish
+):
+    channel = make_channel()
+    method = Mock()
+    method.delivery_tag = 17
+    method.redelivered = False
+
+    # Pretend an older debug artifact exists with a different requirement set.
+    consumer.DEBUG_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    consumer.DEBUG_RESPONSE_PATH.write_text(
+        json.dumps(
+            {
+                "eventType": "RFP_ANALYSIS_COMPLETED",
+                "result": {
+                    "requirements": [
+                        {"content": f"stale-{index}"} for index in range(106)
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    mock_process.return_value = [
+        {
+            "text": "Fresh requirement from current extraction",
+            "mandatory": True,
+            "confidence": "High",
+            "evidence_match": {
+                "status": "REVIEW_REQUIRED",
+                "evidence": [{"text": "CBS evidence", "source": "kb.pdf", "page": 1}],
+                "note": "Review required.",
+            },
+        }
+    ]
+
+    callback(
+        channel,
+        method,
+        Mock(),
+        json.dumps(make_message()).encode("utf-8"),
+    )
+
+    published = mock_publish.call_args.args[0]
+    assert published["eventType"] == "RFP_ANALYSIS_COMPLETED"
+    assert len(published["result"]["requirements"]) == 1
+    assert published["result"]["requirements"][0]["content"] == (
+        "Fresh requirement from current extraction"
+    )
+    assert published["result"]["requirements"][0]["evidenceMatch"]["status"] == (
+        "REVIEW_REQUIRED"
+    )
+    saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
+    assert len(saved["result"]["requirements"]) == 1
+    assert "stale-0" not in json.dumps(saved)
 
 
 @patch("app.messaging.consumer.publish_message")
@@ -176,6 +225,7 @@ def test_missing_status_ids_requeues_without_publishing_or_acknowledging(
     method.redelivered = False
     message = make_message()
     del message["analysisId"]
+    mock_process.return_value = [{"text": "Requirement"}]
 
     callback(
         channel,
@@ -204,6 +254,7 @@ def test_publish_failure_does_not_acknowledge_request(
     method = Mock()
     method.delivery_tag = 15
     method.redelivered = False
+    mock_process.return_value = [{"text": "Requirement"}]
     mock_publish.side_effect = RuntimeError("Simulated publish failure")
 
     callback(

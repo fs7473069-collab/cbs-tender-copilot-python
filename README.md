@@ -33,7 +33,7 @@ Java Backend
        Java Backend
 ```
 
-Java stores the tender file in S3 and sends a document reference over RabbitMQ. Python downloads the file, extracts text, chunks it, runs Qwen3 8B locally through Ollama, and returns structured requirements.
+The Java upload service stores the tender file in S3 and sends a document reference over the request queue. Python downloads the file from the S3 bucket/key in the message, extracts text, chunks it, runs Qwen3 8B locally through Ollama, and publishes an `RFP_ANALYSIS_COMPLETED` JSON response to `rfp_docs_response1` for the Java backend.
 
 Python does not own users, organisations, or authentication. Those stay on the Java backend.
 
@@ -138,13 +138,13 @@ RABBITMQ_QUEUE=copilot-analysis
 
 The request queue is configurable through `RABBITMQ_QUEUE`. The application currently uses `copilot-analysis` in its configured integration environment. The consumer's code-level fallback is `rfp-python-test` when the environment variable is not set.
 
-The response publisher is configured to publish to:
+The response queue is currently hard-coded in `app/messaging/publisher.py` as:
 
 ```text
-rfp-python-response-test
+rfp_docs_response1
 ```
 
-Confirm queue names with the Java integration configuration before using a shared or production environment. Avoid consuming production messages during isolated development.
+Zeeshan has confirmed that the Java backend consumes `rfp_docs_response1`. Use a separate request queue (or isolated test queue) during development so local consumers do not take production analysis messages.
 
 ## Run
 
@@ -180,7 +180,7 @@ The pipeline:
 
 ### RabbitMQ consumer
 
-The consumer waits for a RabbitMQ message, downloads the referenced S3 object, processes the document, builds a completion response, publishes the response, and acknowledges the request after successful processing.
+The consumer waits for a RabbitMQ message, downloads the referenced S3 object, runs the extraction pipeline, builds an `RFP_ANALYSIS_COMPLETED` JSON response, publishes it to `rfp_docs_response1`, and acknowledges the request after successful processing.
 
 Run:
 
@@ -188,7 +188,12 @@ Run:
 python -m app.messaging.consumer
 ```
 
-The consumer currently processes the first document in the request's `documents` list. Multi-document processing within a single request is not yet implemented.
+Current messaging behaviour:
+
+- Only the first document in the request's `documents` list is processed.
+- A status companion event may be built locally but is not published.
+- Failed analysis does not currently publish a dedicated FAILED event.
+- Long-running extraction can be slow on CPU/RAM-constrained deployment VMs.
 
 ### Tests
 
@@ -250,34 +255,41 @@ Qwen3 4B remains a research candidate.
 
 ## S3 and RabbitMQ Integration
 
-The Python service receives a document reference through RabbitMQ and downloads the actual document from S3.
+The Java upload service uploads tender documents to S3. The Python consumer receives a document reference through the request queue (`RABBITMQ_QUEUE`), downloads the object from the S3 bucket/key in the message, runs the extraction pipeline, and publishes an `RFP_ANALYSIS_COMPLETED` JSON response to `rfp_docs_response1`.
 
 The integration flow is:
 
 ```text
-RabbitMQ request
+Java upload service
+       |
+       v
+S3 tender document
+       |
+       v
+RabbitMQ request queue (RABBITMQ_QUEUE)
        |
        v
 Python consumer
        |
        v
-S3 document download
+S3 document download (bucket/key from message)
        |
        v
-Document processing
+Document processing / requirement extraction
        |
        v
-Requirement extraction
+RFP_ANALYSIS_COMPLETED JSON
        |
        v
-RFP_ANALYSIS_COMPLETED response
-       |
-       v
-RabbitMQ response queue
+rfp_docs_response1  (hard-coded in publisher.py)
        |
        v
 Java backend
 ```
+
+Request queue: configurable via `RABBITMQ_QUEUE` (integration env commonly `copilot-analysis`; code fallback `rfp-python-test`).
+
+Response queue: hard-coded `rfp_docs_response1` in `app/messaging/publisher.py`. Confirmed by Zeeshan as the queue consumed by the Java backend.
 
 ### Verified integration results
 
@@ -288,7 +300,7 @@ The CBS DOCX integration was previously tested:
 - 16,591 characters extracted
 - 21 chunks created
 
-A later fresh 21-chunk Qwen3 8B run timed out at chunk 9/21 after 120 seconds. The pipeline should therefore be considered subject to model-processing timeouts on longer documents.
+A later fresh 21-chunk Qwen3 8B run timed out at chunk 9/21 after 120 seconds. The pipeline should therefore be considered subject to model-processing timeouts on longer documents and constrained VMs.
 
 A subsequent RabbitMQ integration run successfully:
 
@@ -296,12 +308,10 @@ A subsequent RabbitMQ integration run successfully:
 - Downloaded the requested S3 document
 - Reused the 91 previously saved chunks and 266 saved requirements
 - Built an `RFP_ANALYSIS_COMPLETED` response
-- Published the response to `rfp-python-response-test`
+- Published a completed response (historical note: that run targeted `rfp-python-response-test`; the current publisher target is `rfp_docs_response1`)
 - Acknowledged the request
 
-The response queue showed two ready messages after the run. Those messages were left in the queue for Java-side processing.
-
-**Integration status:** Python-side request processing and response publishing have been verified for this run. Java-side consumption, response-schema compatibility, and end-to-end completion have not yet been confirmed.
+**Integration status:** Python-side request processing and publishing of `RFP_ANALYSIS_COMPLETED` to `rfp_docs_response1` match the confirmed Java consumption queue. Full frontend-to-backend end-to-end acceptance has not been claimed here. Status companion events are not published, and failed analysis does not emit a dedicated FAILED event.
 
 The response builder currently assigns the first document's ID to requirement source metadata. Correct source mapping for requests containing multiple documents remains a limitation.
 
@@ -309,13 +319,17 @@ The response builder currently assigns the first document's ID to requirement so
 
 - DOCX is currently treated as one logical page; accurate physical page tracking is not implemented.
 - The consumer processes only the first document in a request.
+- A status companion event may be built but is not published.
+- Failed analysis does not currently publish a dedicated FAILED event.
+- Long-running extraction may be slow on the deployed VM due to CPU/RAM constraints.
 - Source document mapping is not yet fully handled for multi-document requests.
+- The response queue name is hard-coded in `app/messaging/publisher.py` (not env-configurable).
 - A full Qwen3 4B run on all EV tender chunks was not completed.
 - Qwen3 8B valid JSON does not mean 100% semantic accuracy.
 - Some possible fragments/headings remain quality warnings.
 - The existing CBS 75-requirement file is from an earlier pipeline run and does not include the newer source metadata.
 - A later fresh CBS 21-chunk Qwen3 8B run timed out at chunk 9/21 after 120 seconds.
-- Java-side response consumption and schema compatibility are pending confirmation.
+- Full frontend-to-backend end-to-end testing is not claimed as passed in this documentation.
 - Scanned/image-only PDFs require OCR, which is not included in this MVP.
 - The current MVP has not yet been established as production-ready.
 
@@ -340,7 +354,9 @@ The response builder currently assigns the first document's ID to requirement so
 - Agentic RFP workflows
 - Additional LLM providers
 - Broader evaluation datasets
-- Java-side response validation and end-to-end integration testing
+- Env-configurable response queue and dedicated FAILED / status event publishing
+- Multi-document request processing
+- Broader frontend-to-backend end-to-end acceptance testing
 - Improved retry handling, observability, and processing-timeout management
 
 ## Security

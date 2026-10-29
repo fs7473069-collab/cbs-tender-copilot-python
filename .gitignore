@@ -47,3 +47,7 @@ request.json
 # Local test artifacts
 response.json
 test_saved_response.py
+
+# Locally generated analysis data
+/local_data/*
+!/local_data/.gitkeep

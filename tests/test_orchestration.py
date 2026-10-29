@@ -15,6 +15,18 @@ def isolate_storage(monkeypatch, tmp_path):
     )
 
 
+@pytest.fixture(autouse=True)
+def mock_evidence_matcher(monkeypatch):
+    """Ordinary orchestration tests must not call a local Ollama server."""
+    class Matcher:
+        def match_requirement(self, requirement, top_k=3):
+            return {"status": "NOT_FOUND", "evidence": [], "note": "Mocked"}
+
+    monkeypatch.setattr(
+        "app.orchestration.service.RequirementEvidenceMatcher", Matcher,
+    )
+
+
 def test_process_pdf_document(monkeypatch, tmp_path):
     isolate_storage(monkeypatch, tmp_path)
 
@@ -134,3 +146,68 @@ def test_resume_skips_completed_chunks(monkeypatch, tmp_path):
     assert calls.count("First chunk") == 1
     assert calls.count("Second chunk") == 2
     assert len(result) == 2
+
+
+def test_process_attaches_evidence_match(monkeypatch, tmp_path):
+    isolate_storage(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(
+        "app.orchestration.service.extract_pdf_text",
+        lambda path: [{"page": 1, "text": "Tender requirement"}],
+    )
+    monkeypatch.setattr(
+        "app.orchestration.service.create_chunks",
+        lambda pages: [{"page": 1, "text": "Tender requirement"}],
+    )
+    monkeypatch.setattr(
+        "app.orchestration.service.extract_requirements",
+        lambda chunk: {
+            "requirements": [
+                {
+                    "text": "The system must support vehicle tracking.",
+                    "category": "Functional",
+                    "mandatory": True,
+                    "confidence": "High",
+                }
+            ]
+        },
+    )
+
+    class FakeMatcher:
+        def match_requirement(self, requirement, top_k=3):
+            return {
+                "requirement": requirement["text"],
+                "status": "REVIEW_REQUIRED",
+                "evidence": [
+                    {
+                        "text": "Sample evidence for testing only.",
+                        "source": "sample.docx",
+                        "page": 2,
+                        "similarity": 0.8,
+                    }
+                ],
+                "note": "Test evidence; verify before use.",
+            }
+
+    monkeypatch.setattr(
+        "app.orchestration.service.RequirementEvidenceMatcher",
+        FakeMatcher,
+    )
+
+    result = process_tender_document("integration-test.pdf")
+
+    assert len(result) == 1
+    assert result[0]["evidence_match"]["status"] == "REVIEW_REQUIRED"
+    assert result[0]["evidence_match"]["evidence"][0]["source"] == "sample.docx"
+    assert result[0]["source"]["page"] == 1
+
+    import json
+    import app.orchestration.service as service
+
+    output_files = list(
+        (tmp_path / "output").glob("*.json")
+    )
+    assert len(output_files) == 1
+
+    saved = json.loads(output_files[0].read_text(encoding="utf-8"))
+    assert saved[0]["evidence_match"]["status"] == "REVIEW_REQUIRED"

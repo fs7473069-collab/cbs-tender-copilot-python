@@ -71,6 +71,19 @@ def _build_completed_status_event(message, document):
     }
 
 
+def _save_debug_response(response):
+    """Atomically write the debug copy of the completed response."""
+    DEBUG_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = DEBUG_RESPONSE_PATH.with_suffix(
+        DEBUG_RESPONSE_PATH.suffix + ".tmp"
+    )
+    temporary_path.write_text(
+        json.dumps(response, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary_path.replace(DEBUG_RESPONSE_PATH)
+
+
 def _log_inbound_body(body):
     """Log size and requirement count only; never print the payload."""
     if isinstance(body, memoryview):
@@ -129,24 +142,34 @@ def callback(ch, method, properties, body):
 
         print("\nProcessing document with the existing pipeline...")
 
+        # Source of truth for this job: live extraction + evidence matching.
+        # Do not load local_data/analysis/actual_response.json (may be stale).
         requirements = process_tender_document(local_path)
 
         print(f"Extracted {len(requirements)} requirements")
+        with_evidence = sum(
+            1
+            for requirement in requirements
+            if isinstance(requirement, dict)
+            and "evidence_match" in requirement
+        )
+        print(f"Requirements containing RAG evidence: {with_evidence}")
 
         response = build_completed_response(
             request_message=message,
             requirements=requirements,
         )
-
-        # Save the exact response before publishing.
-        DEBUG_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(DEBUG_RESPONSE_PATH, "w", encoding="utf-8") as file:
-            json.dump(
-                response,
-                file,
-                ensure_ascii=False,
-                indent=2,
+        response_requirements = (
+            (response.get("result") or {}).get("requirements") or []
+        )
+        if len(response_requirements) != len(requirements):
+            raise ValueError(
+                "Completed response requirement count does not match "
+                "fresh extraction results."
             )
+
+        # Debug artifact only; never used as input for publishing.
+        _save_debug_response(response)
 
         print(f"\nResponse saved to: {DEBUG_RESPONSE_PATH.resolve()}")
         print(
@@ -154,29 +177,25 @@ def callback(ch, method, properties, body):
             DEBUG_RESPONSE_PATH.stat().st_size,
             "bytes",
         )
+        print("Event type:", response.get("eventType"))
+        print("Job ID:", response.get("jobId"))
+        print("Requirement count:", len(response_requirements))
 
-        # Verify the saved JSON can be read completely.
-        with open(DEBUG_RESPONSE_PATH, "r", encoding="utf-8") as file:
-            validated_response = json.load(file)
-
-        print("JSON validation: VALID")
-        print("Event type:", validated_response.get("eventType"))
-        print("Job ID:", validated_response.get("jobId"))
-        print(
-            "Requirement count:",
-            len(validated_response.get("result", {}).get("requirements", [])),
-        )
-
+        # Validate request IDs for the companion status event before publish.
         status_event = _build_completed_status_event(
             message=message,
             document=document,
         )
 
-        print("\nPublishing completion response to the test queue...")
-
-        publish_message(status_event)
-
+        print("\nPublishing completion response to the response queue...")
+        # Publish the fresh RFP_ANALYSIS_COMPLETED payload (with requirements),
+        # not a status-only shell and not a previously saved analysis file.
+        publish_message(response)
         print("Completion response published successfully.")
+        print(
+            "Status companion event prepared "
+            f"(not published): {status_event['eventType']}"
+        )
 
         # Acknowledge only after publishing succeeds.
         if ch.is_open:

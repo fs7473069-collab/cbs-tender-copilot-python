@@ -211,3 +211,33 @@ def test_multiple_documents_are_listed_in_response():
         response["result"]["requirements"][0]["sources"][0]["documentId"]
         == "document-123"
     )
+
+def test_response_includes_rag_evidence_match():
+    requirements = [
+        {
+            "text": "The system must support vehicle tracking.",
+            "mandatory": True,
+            "confidence": "High",
+            "evidence_match": {
+                "status": "REVIEW_REQUIRED",
+                "evidence": [
+                    {
+                        "text": "Sample fleet tracking evidence.",
+                        "source": "sample_project.docx",
+                        "page": 1,
+                        "similarity": 0.81,
+                    }
+                ],
+                "note": "Fictional test evidence; verify before use.",
+            },
+        }
+    ]
+
+    response = build_completed_response(sample_request(), requirements)
+    requirement = response["result"]["requirements"][0]
+
+    assert requirement["evidenceMatch"]["status"] == "REVIEW_REQUIRED"
+    assert requirement["evidenceMatch"]["evidence"][0]["source"] == "sample_project.docx"
+    assert requirement["evidenceMatch"]["evidence"][0]["page"] == 1
+    assert requirement["evidenceMatch"]["evidence"][0]["similarity"] == 0.81
+    assert "verify before use" in requirement["evidenceMatch"]["note"]

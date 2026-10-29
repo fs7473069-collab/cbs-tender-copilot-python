@@ -234,10 +234,10 @@ Possible fragments, headings, and similar extractions remain quality warnings ra
 
 The CBS tender (`tender.docx`) was used to validate document retrieval and DOCX processing in the S3 + RabbitMQ integration path.
 
-Verified integration steps:
+Verified integration steps (historical isolated-queue run):
 
 * RabbitMQ message received successfully using the isolated test queue `rfp-python-test`.
-* S3 document download succeeded.
+* S3 document download succeeded (Java upload path stores the tender; Python downloads by bucket/key).
 * DOCX file processed: `tender.docx`.
 * Extracted characters: 16,591.
 * Chunks created: 21.
@@ -258,21 +258,28 @@ This evaluation does not claim that a full 21-chunk fresh CBS pipeline run compl
 
 # 14. RabbitMQ Evaluation
 
-Two queues are defined in the project:
+Queues relevant to the current implementation:
 
-* Production/application queue: `copilot-analysis`
-* Isolated Python test queue: `rfp-python-test`
+* Request queue: configurable through `RABBITMQ_QUEUE` (integration env commonly `copilot-analysis`; consumer code fallback `rfp-python-test`).
+* Response queue: `rfp_docs_response1` (hard-coded in `app/messaging/publisher.py`; confirmed by Zeeshan as consumed by the Java backend).
 
-Verified:
+Historical / isolated testing note:
 
-* The isolated `rfp-python-test` queue was successfully tested. A message was received and processing started from that queue.
+* An earlier evaluation used the isolated Python test request queue `rfp-python-test` only. A message was received and processing started from that queue.
+
+Confirmed contract (implementation + Java confirmation):
+
+* Completed analysis responses are published as `RFP_ANALYSIS_COMPLETED` JSON to `rfp_docs_response1`.
+* The consumer processes only the first document in `documents`.
+* A status companion event may be built but is not published.
+* Failed analysis does not currently publish a dedicated FAILED event.
 
 Not claimed:
 
-* The production `copilot-analysis` queue was not consumed as part of this evaluation.
-* A full production end-to-end Java-to-Python-to-Java test on `copilot-analysis` is not claimed.
+* Full frontend-to-backend end-to-end acceptance testing has not been claimed as passed in this evaluation.
+* Long-running extraction may still be slow or time out on CPU/RAM-constrained deployment VMs (see CBS timeout notes above).
 
-**Result: PASS for isolated test-queue consumption only**
+**Result: PASS for isolated historical request-queue consumption; response queue `rfp_docs_response1` confirmed with Java. Full UI/backend E2E acceptance: not claimed.**
 
 ---
 
@@ -306,7 +313,7 @@ The Python document-intelligence MVP has been validated on the EV Charging Netwo
 
 Qwen3 8B is the current MVP model. Qwen3 4B was sampled, then stopped due to slow runtime and invalid JSON, and remains a research candidate.
 
-CBS integration was validated through S3 download, isolated RabbitMQ test-queue consumption, DOCX extraction (16,591 characters), and 21 chunks. An earlier CBS pipeline produced 75 requirements without the new source metadata. A later fresh CBS LLM run timed out at chunk 9/21 after 120 seconds and did not finish.
+CBS integration was validated through S3 download, isolated RabbitMQ test-queue consumption, DOCX extraction (16,591 characters), and 21 chunks. An earlier CBS pipeline produced 75 requirements without the new source metadata. A later fresh CBS LLM run timed out at chunk 9/21 after 120 seconds and did not finish. The confirmed response queue for completed analysis is `rfp_docs_response1`; full frontend-to-backend end-to-end acceptance is not claimed here.
 
 ---
 
@@ -317,6 +324,10 @@ CBS integration was validated through S3 download, isolated RabbitMQ test-queue 
 * Possible fragments and headings are still quality warnings.
 * The existing CBS 75-requirement file does not include the new source metadata.
 * A full fresh CBS 21-chunk Qwen3 8B run did not complete (timeout at chunk 9/21 after 120 seconds).
-* The production RabbitMQ queue `copilot-analysis` was not consumed or fully end-to-end tested in this evaluation.
-* Isolated-queue success does not prove production-queue behaviour.
+* Long-running extraction may be slow on the deployed VM due to CPU/RAM constraints.
+* The consumer processes only the first document in a request.
+* Status companion events are built but not published; dedicated FAILED events are not published.
+* The response queue is hard-coded as `rfp_docs_response1` (confirmed with Java) rather than env-configurable.
+* Full frontend-to-backend end-to-end acceptance testing is not claimed as passed in this evaluation.
+* Historical isolated-queue success (`rfp-python-test`) does not by itself prove production request-queue behaviour.
 * OCR for scanned/image-only documents is not part of this evaluation.

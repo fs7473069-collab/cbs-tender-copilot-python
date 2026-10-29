@@ -17,6 +17,37 @@ def confidence_to_score(value):
     return None
 
 
+
+def format_evidence_match(evidence_match):
+    """Format RAG evidence separately from the tender source."""
+    if not isinstance(evidence_match, dict):
+        return {
+            "status": "NOT_CHECKED",
+            "evidence": [],
+            "note": "No evidence-matching result was provided.",
+        }
+
+    evidence = []
+    for item in evidence_match.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+
+        evidence.append({
+            "text": item.get("text"),
+            "source": item.get("source"),
+            "page": item.get("page"),
+            "similarity": item.get("similarity", item.get("score")),
+        })
+
+    return {
+        "status": evidence_match.get("status", "REVIEW_REQUIRED"),
+        "evidence": evidence,
+        "note": evidence_match.get(
+            "note",
+            "Retrieved evidence requires human verification.",
+        ),
+    }
+
 def build_completed_response(
     request_message,
     requirements,
@@ -67,6 +98,9 @@ def build_completed_response(
                     "confidence": source_confidence,
                 }
             ],
+            "evidenceMatch": format_evidence_match(
+                requirement.get("evidence_match")
+            ),
         })
 
     return {

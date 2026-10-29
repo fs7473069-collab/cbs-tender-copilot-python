@@ -22,8 +22,23 @@ def download_file(bucket, key, local_path):
         Filename=local_path,
     )
 
-    return local_path   
-   
-   
-  
-  
+    return local_path
+
+def upload_file(local_path, bucket, key):
+    if not os.path.isfile(local_path):
+        raise FileNotFoundError(
+            f"Report file not found: {local_path}"
+        )
+
+    s3 = create_s3_client()
+
+    s3.upload_file(
+        Filename=local_path,
+        Bucket=bucket,
+        Key=key,
+    )
+
+    return key
+
+
+
