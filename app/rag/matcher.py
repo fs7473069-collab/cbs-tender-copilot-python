@@ -172,8 +172,12 @@ class RequirementEvidenceMatcher:
         started = time.perf_counter()
         assessment = assess_evidence_relevance(requirement_text, evidence_text)
         elapsed = time.perf_counter() - started
-        # Never cache an invalid or failed decision.
-        if isinstance(assessment, dict) and isinstance(assessment.get("relevant"), bool):
+        # Never cache invalid, failed, or explicitly unassessed decisions.
+        if (
+            isinstance(assessment, dict)
+            and isinstance(assessment.get("relevant"), bool)
+            and not assessment.get("unassessed")
+        ):
             self._cache[key] = {
                 "relevant": assessment["relevant"],
                 "reason": assessment.get("reason", ""),
@@ -403,19 +407,38 @@ class RequirementEvidenceMatcher:
                     job for job in round_jobs if job.get("assessment") is None
                 ]
                 if uncached:
+                    # Production path: always batch uncached pairs for this
+                    # round (single-pair rounds still go through the batch
+                    # helper, which logs and delegates to the single assessor).
+                    print(
+                        "Evidence relevance matcher: calling "
+                        "assess_evidence_relevance_batch "
+                        f"uncached_pairs={len(uncached)} "
+                        f"round_jobs={len(round_jobs)} "
+                        f"active_requirements={sum(1 for s in states if not s['done'])}",
+                        flush=True,
+                    )
                     started = time.perf_counter()
                     batch_assessments = assess_evidence_relevance_batch([
                         (job["requirement_text"], job["item"]["text"])
                         for job in uncached
                     ])
                     batch_elapsed = time.perf_counter() - started
+                    if len(batch_assessments) != len(uncached):
+                        raise ValueError(
+                            "Batch relevance helper returned a mismatched "
+                            f"result count ({len(batch_assessments)} != "
+                            f"{len(uncached)})."
+                        )
                     share = batch_elapsed / len(uncached)
                     for job, assessment in zip(uncached, batch_assessments):
                         job["assessment"] = assessment
                         job["llm_elapsed"] = share
                         job["cache_hit"] = False
-                        if isinstance(assessment, dict) and isinstance(
-                            assessment.get("relevant"), bool
+                        if (
+                            isinstance(assessment, dict)
+                            and isinstance(assessment.get("relevant"), bool)
+                            and not assessment.get("unassessed")
                         ):
                             key = self._cache_key(
                                 job["requirement_text"], job["item"]["text"]
@@ -434,7 +457,12 @@ class RequirementEvidenceMatcher:
                     else:
                         state["relevance_calls"] += 1
                         state["llm_seconds"] += float(job.get("llm_elapsed") or 0.0)
-                    if not assessment or not assessment.get("relevant"):
+                    # Unassessed (e.g. batch timeout) is never accepted evidence.
+                    if (
+                        not assessment
+                        or assessment.get("unassessed")
+                        or not assessment.get("relevant")
+                    ):
                         continue
                     state["evidence"].append({
                         "text": job["item"]["text"],

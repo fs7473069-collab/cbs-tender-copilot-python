@@ -4,7 +4,9 @@ from docx import Document
 
 from app.document.chunker import create_chunks
 from app.document.docx_processor import extract_docx_text
+from app.llm.ollama_client import chunk_extraction_decision
 from app.llm.ollama_client import chunk_may_contain_requirements
+from app.llm.ollama_client import clear_extract_requirements_cache
 from app.llm.ollama_client import extract_requirements
 from app.orchestration.service import process_tender_document
 from app.rag.matcher import RequirementEvidenceMatcher
@@ -52,6 +54,7 @@ def test_malformed_llm_response_is_rejected(monkeypatch):
 
 
 def test_extract_skips_glossary_and_site_inventory_without_llm(monkeypatch):
+    clear_extract_requirements_cache()
     calls = []
 
     def _boom(prompt, **kwargs):
@@ -74,10 +77,94 @@ def test_extract_skips_glossary_and_site_inventory_without_llm(monkeypatch):
     }
     assert extract_requirements(glossary) == {"requirements": []}
     assert extract_requirements(site) == {"requirements": []}
+    assert chunk_extraction_decision(glossary["text"])[1] == "glossary_term_definition"
+    assert chunk_extraction_decision(site["text"])[1] == "site_inventory"
     assert calls == []
 
 
+def test_extract_skips_blank_page_and_dotted_toc_without_llm(monkeypatch):
+    clear_extract_requirements_cache()
+    calls = []
+    monkeypatch.setattr(
+        "app.llm.ollama_client.generate_response",
+        lambda *args, **kwargs: calls.append(1) or (_ for _ in ()).throw(
+            AssertionError("LLM must not run")
+        ),
+    )
+    blank = {"text": "This page intentionally left blank."}
+    toc = {
+        "text": (
+            "Table of Contents\n"
+            "Introduction .......... 1\n"
+            "Scope .......... 2\n"
+            "Annexes .......... 12\n"
+        ),
+    }
+    assert chunk_extraction_decision(blank["text"]) == (
+        False, "intentionally_left_blank"
+    )
+    assert chunk_extraction_decision(toc["text"]) == (
+        False, "table_of_contents_dotted"
+    )
+    assert extract_requirements(blank) == {"requirements": []}
+    assert extract_requirements(toc) == {"requirements": []}
+    assert calls == []
+
+
+def test_extract_does_not_skip_merely_for_missing_obligation_keywords(monkeypatch):
+    """Priority/feature tables without shall/must still go to the LLM."""
+    clear_extract_requirements_cache()
+    calls = []
+
+    def _ok(prompt, **kwargs):
+        calls.append(prompt)
+        return json.dumps({"requirements": []})
+
+    monkeypatch.setattr("app.llm.ollama_client.generate_response", _ok)
+    feature_table = {
+        "text": (
+            "Feature Description Priority Role-based access Distinct "
+            "permissions for admin and support. M Remote session control "
+            "Remote start/stop of a session by an operator."
+        ),
+    }
+    should_extract, reason = chunk_extraction_decision(feature_table["text"])
+    assert should_extract is True
+    assert reason == "default_extract"
+    assert extract_requirements(feature_table) == {"requirements": []}
+    assert len(calls) == 1
+
+
+def test_extract_reuses_cache_for_identical_chunk_text(monkeypatch):
+    clear_extract_requirements_cache()
+    calls = []
+
+    def _ok(prompt, **kwargs):
+        calls.append(prompt)
+        return json.dumps({
+            "requirements": [{
+                "text": "The vendor shall provide SSO.",
+                "category": "Functional",
+                "mandatory": True,
+                "confidence": "High",
+            }],
+        })
+
+    monkeypatch.setattr("app.llm.ollama_client.generate_response", _ok)
+    chunk = {
+        "text": "Priority: M The vendor shall provide SSO for administrators.",
+    }
+    first = extract_requirements(chunk)
+    second = extract_requirements({"text": chunk["text"]})
+    third = extract_requirements({
+        "text": "Priority: M   The vendor shall provide SSO for administrators.",
+    })
+    assert first == second == third
+    assert len(calls) == 1
+
+
 def test_extract_keeps_ownership_and_priority_rows_for_llm(monkeypatch):
+    clear_extract_requirements_cache()
     calls = []
 
     def _ok(prompt, **kwargs):
@@ -106,13 +193,25 @@ def test_extract_keeps_ownership_and_priority_rows_for_llm(monkeypatch):
     priority_newlines = {
         "text": "Priority:\nM\nThe\nvendor\nshall\nprovide\naudit\nlogs.",
     }
+    ownership_matrix = {
+        "text": (
+            "Table headers: Component | Option A (Core) | Option B | Option C\n"
+            "Component: Pricing & product engine | Option A (Core): Qualiteq | "
+            "Option B: Vendor | Option C: Vendor"
+        ),
+    }
     assert chunk_may_contain_requirements(ownership["text"]) is True
     assert chunk_may_contain_requirements(priority["text"]) is True
     assert chunk_may_contain_requirements(priority_newlines["text"]) is True
+    assert chunk_may_contain_requirements(ownership_matrix["text"]) is True
+    assert chunk_extraction_decision(ownership_matrix["text"])[1] == (
+        "requirement_signal"
+    )
     assert len(extract_requirements(ownership)["requirements"]) == 1
     assert len(extract_requirements(priority)["requirements"]) == 1
     assert len(extract_requirements(priority_newlines)["requirements"]) == 1
-    assert len(calls) == 3
+    assert len(extract_requirements(ownership_matrix)["requirements"]) == 1
+    assert len(calls) == 4
 
 
 def test_reports_read_completed_analysis_only(tmp_path):
