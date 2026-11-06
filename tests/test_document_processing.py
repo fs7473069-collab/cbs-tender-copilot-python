@@ -1,11 +1,21 @@
+from pathlib import Path
+
+import pytest
+
 from app.document.pdf_processor import extract_pdf_text
 from app.document.chunker import create_chunks
 from app.document.table_extractor import extract_pdf_tables
 from app.requirements.extractor import Requirement, prepare_llm_input
 
 PDF_PATH = "data/sample tender.pdf"
+_SAMPLE_TENDER_PDF = Path(__file__).resolve().parents[1] / PDF_PATH
+_SKIP_IF_SAMPLE_TENDER_ABSENT = pytest.mark.skipif(
+    not _SAMPLE_TENDER_PDF.is_file(),
+    reason="local-only asset absent: data/sample tender.pdf",
+)
 
 
+@_SKIP_IF_SAMPLE_TENDER_ABSENT
 def test_pdf_text_extraction():
     pages = extract_pdf_text(PDF_PATH)
     assert len(pages) == 11
@@ -14,6 +24,7 @@ def test_pdf_text_extraction():
     assert pages[0]["text"]
 
 
+@_SKIP_IF_SAMPLE_TENDER_ABSENT
 def test_chunk_creation():
     pages = extract_pdf_text(PDF_PATH)
     chunks = create_chunks(pages)
@@ -25,6 +36,7 @@ def test_chunk_creation():
     assert chunks[0]["text"]
 
 
+@_SKIP_IF_SAMPLE_TENDER_ABSENT
 def test_table_extraction():
     tables = extract_pdf_tables(PDF_PATH)
     assert len(tables) == 14
@@ -51,6 +63,7 @@ def test_requirement_structure():
     assert requirement.confidence == "High"
 
 
+@_SKIP_IF_SAMPLE_TENDER_ABSENT
 def test_source_tracking():
     pages = extract_pdf_text(PDF_PATH)
 
@@ -71,6 +84,7 @@ def test_source_tracking():
     assert source_page["text"]
 
 
+@_SKIP_IF_SAMPLE_TENDER_ABSENT
 def test_llm_input_preparation():
     pages = extract_pdf_text(PDF_PATH)
     chunks = create_chunks(pages)

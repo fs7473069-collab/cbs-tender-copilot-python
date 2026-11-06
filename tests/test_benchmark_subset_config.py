@@ -7,6 +7,7 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / "diagnostics" / "benchmark_subset_extract_match.py"
+EV_CHUNKS_PATH = PROJECT_ROOT / "chunks" / "ev_tender_chunks.json"
 
 
 def _load_benchmark_module():
@@ -31,6 +32,10 @@ def test_parse_selection_smoke_ownership_flag():
     )
 
 
+@pytest.mark.skipif(
+    not EV_CHUNKS_PATH.is_file(),
+    reason="local-only asset absent: chunks/ev_tender_chunks.json",
+)
 def test_load_inputs_full_is_exactly_three():
     mod = _load_benchmark_module()
     inputs = mod._load_inputs(selection=mod.SELECTION_FULL)

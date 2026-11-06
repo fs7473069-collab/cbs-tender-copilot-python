@@ -393,7 +393,8 @@ def test_relevance_failure_is_not_cached(monkeypatch, tmp_path):
     matcher = RequirementEvidenceMatcher(retriever=retriever, cache_path=tmp_path / "cache.json")
     monkeypatch.setattr("app.rag.matcher.assess_evidence_relevance", lambda *_: (_ for _ in ()).throw(OSError("offline")))
     result = matcher.match_requirement("Provide fleet vehicle tracking.")
-    assert result["status"] == "NOT_FOUND"
+    assert result["status"] == "NOT_CHECKED"
+    assert result["relevance"]["status"] == "INCOMPLETE"
     assert result["timings"]["relevance_llm_calls"] == 0
     assert not (tmp_path / "cache.json").exists()
 

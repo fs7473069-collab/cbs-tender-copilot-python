@@ -22,7 +22,7 @@ from app.rag import matcher as matcher_mod
 from app.storage.s3_data_locally import generate_local_excel
 from app.storage.s3_data_locally import generate_local_word
 
-SOURCE_TENDER = PROJECT_ROOT / "data" / "sample tender.pdf"
+SOURCE_TENDER = PROJECT_ROOT / "data" / "s3_test" / "tender.pdf"
 E2E_DIR = PROJECT_ROOT / "data" / "e2e_new_tender"
 E2E_TENDER = E2E_DIR / "representative_new_tender.pdf"
 REPORT_DIR = PROJECT_ROOT / "local_data" / "reports" / "e2e_new_tender"

@@ -51,3 +51,6 @@ test_saved_response.py
 # Locally generated analysis data
 /local_data/*
 !/local_data/.gitkeep
+
+# Generated diagnostic output
+diagnostics/e2e_new_tender_metrics.json

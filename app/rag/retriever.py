@@ -1,5 +1,6 @@
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -11,9 +12,28 @@ import requests
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "nomic-embed-text"
 
-KB_DIR = Path("local_data/cbs_knowledge_base")
+# Anchored to the project root so the consumer's working directory is irrelevant.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+KB_DIR = PROJECT_ROOT / "local_data" / "cbs_knowledge_base"
 INDEX_PATH = KB_DIR / "cbs.index"
 METADATA_PATH = KB_DIR / "chunks.json"
+INGEST_HINT = "Build it with: python -m app.rag.ingest"
+# Opt-in: "|"-separated exact KB source names hidden from retrieval without
+# changing the index. Unset or empty keeps every indexed source searchable.
+KB_EXCLUDE_SOURCES_ENV = "CBS_KB_EXCLUDE_SOURCES"
+
+
+def excluded_sources_from_env():
+    raw = os.getenv(KB_EXCLUDE_SOURCES_ENV) or ""
+    return frozenset(name.strip() for name in raw.split("|") if name.strip())
+
+
+class RetrievalError(RuntimeError):
+    """Evidence retrieval could not run; never equivalent to 'no match'."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 # Process a small number of chunks per Ollama request.
 BATCH_SIZE = 8
@@ -73,11 +93,27 @@ def create_embeddings(texts):
     return np.vstack(all_embeddings)
 
 
+def _embed_queries(texts):
+    try:
+        return create_embeddings(texts)
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+        raise RetrievalError(
+            "embedding_failed",
+            f"Query embedding failed with model {EMBED_MODEL}: "
+            f"{type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
+
+
 class TenderRetriever:
-    def __init__(self, persist=True):
+    def __init__(self, persist=True, excluded_sources=None):
         self.index = None
         self.chunks = []
         self.persist = persist
+        self.load_error = None
+        self.excluded_sources = (
+            excluded_sources_from_env()
+            if excluded_sources is None else frozenset(excluded_sources)
+        )
         # Cache exact query strings within one process to avoid repeat embeds.
         self._query_embedding_cache = {}
 
@@ -115,6 +151,7 @@ class TenderRetriever:
 
         self.index = index
         self.chunks = normalized_chunks
+        self.load_error = None
 
         if self.persist:
             self.save()
@@ -144,18 +181,51 @@ class TenderRetriever:
         print(f"Saved chunk metadata: {METADATA_PATH}")
 
     def load(self):
-        if not INDEX_PATH.exists() or not METADATA_PATH.exists():
+        """Load the persisted index; on failure record why in ``load_error``."""
+        self.load_error = None
+        missing = [
+            path.name for path in (INDEX_PATH, METADATA_PATH)
+            if not path.exists()
+        ]
+        if missing:
+            self.load_error = RetrievalError(
+                "index_missing",
+                f"Knowledge-base index files missing in {KB_DIR}: "
+                f"{', '.join(missing)}. {INGEST_HINT}",
+            )
+            print(f"EVIDENCE_RETRIEVAL load_failed code=index_missing missing={missing}", flush=True)
             return False
 
-        chunks = json.loads(
-            METADATA_PATH.read_text(encoding="utf-8")
-        )
-        index = faiss.read_index(str(INDEX_PATH))
-
-        if index.ntotal != len(chunks):
-            raise ValueError(
-                "FAISS index and metadata counts do not match."
+        try:
+            chunks = json.loads(
+                METADATA_PATH.read_text(encoding="utf-8")
             )
+            index = faiss.read_index(str(INDEX_PATH))
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.load_error = RetrievalError(
+                "index_unreadable",
+                f"Knowledge-base index could not be read "
+                f"({type(exc).__name__}). {INGEST_HINT}",
+            )
+            print(
+                "EVIDENCE_RETRIEVAL load_failed code=index_unreadable "
+                f"error_type={type(exc).__name__}",
+                flush=True,
+            )
+            return False
+
+        if not isinstance(chunks, list) or index.ntotal != len(chunks):
+            self.load_error = RetrievalError(
+                "index_metadata_mismatch",
+                "FAISS index and metadata counts do not match. "
+                f"{INGEST_HINT}",
+            )
+            print(
+                "EVIDENCE_RETRIEVAL load_failed code=index_metadata_mismatch "
+                f"index_vectors={index.ntotal}",
+                flush=True,
+            )
+            return False
 
         self.index = index
         self.chunks = chunks
@@ -163,27 +233,72 @@ class TenderRetriever:
         print(f"Loaded {len(chunks)} knowledge-base chunks.")
         return True
 
+    def _require_index(self):
+        if self.index is None or not self.chunks:
+            if self.load_error is not None:
+                raise self.load_error
+            raise RetrievalError(
+                "index_empty",
+                f"Knowledge base is empty. Ingest documents first. {INGEST_HINT}",
+            )
+
+    def status(self):
+        """Non-sensitive availability summary for startup diagnostics."""
+        if self.index is not None and self.chunks:
+            return {
+                "available": True,
+                "chunks": len(self.chunks),
+                "dimension": int(self.index.d),
+                "error_code": None,
+            }
+        return {
+            "available": False,
+            "chunks": 0,
+            "dimension": None,
+            "error_code": getattr(self.load_error, "code", "index_empty"),
+        }
+
+    def active_exclusions(self):
+        """Configured excluded source names that are present in the index."""
+        present = {chunk.get("source") for chunk in self.chunks}
+        return sorted(self.excluded_sources & present)
+
     def _search(self, query_embedding, top_k):
-        k = min(top_k, len(self.chunks))
+        if query_embedding.shape[-1] != self.index.d:
+            raise RetrievalError(
+                "embedding_dimension_mismatch",
+                f"Query embedding dimension {query_embedding.shape[-1]} does "
+                f"not match index dimension {self.index.d}. {INGEST_HINT}",
+            )
+        excluded = self.excluded_sources
+        hidden = (
+            sum(1 for chunk in self.chunks if chunk.get("source") in excluded)
+            if excluded else 0
+        )
+        # Over-fetch by the hidden count so exclusions never shrink top_k.
+        k = min(top_k + hidden, len(self.chunks))
         scores, indices = self.index.search(query_embedding, k)
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx < 0:
                 continue
             chunk = self.chunks[int(idx)]
+            if excluded and chunk.get("source") in excluded:
+                continue
             results.append({
                 "text": chunk["text"],
                 "source": chunk.get("source", "unknown"),
                 "page": chunk.get("page"),
                 "score": float(score),
+                # Position in chunks.json for the current index build.
+                "kb_chunk_id": int(idx),
             })
+            if len(results) >= top_k:
+                break
         return results
 
     def retrieve(self, question, top_k=3, *, include_metrics=False):
-        if self.index is None or not self.chunks:
-            raise RuntimeError(
-                "Knowledge base is empty. Ingest documents first."
-            )
+        self._require_index()
 
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Question cannot be empty.")
@@ -203,7 +318,7 @@ class TenderRetriever:
                 flush=True,
             )
         else:
-            query_embedding = create_embeddings([question])
+            query_embedding = _embed_queries([question])
             self._query_embedding_cache[cache_key] = query_embedding
             embedding_seconds = time.perf_counter() - embedding_started
 
@@ -220,10 +335,7 @@ class TenderRetriever:
 
     def retrieve_many(self, questions, top_k=3, *, include_metrics=False):
         """Retrieve for many queries, batching uncached embeddings."""
-        if self.index is None or not self.chunks:
-            raise RuntimeError(
-                "Knowledge base is empty. Ingest documents first."
-            )
+        self._require_index()
         if not isinstance(questions, list):
             raise ValueError("Questions must be a list.")
         if top_k < 1:
@@ -247,10 +359,12 @@ class TenderRetriever:
         newly_embedded = set()
         if pending:
             started = time.perf_counter()
-            vectors = create_embeddings(pending)
+            vectors = _embed_queries(pending)
             embedding_seconds = time.perf_counter() - started
             if len(vectors) != len(pending):
-                raise ValueError("Unexpected embedding batch size.")
+                raise RetrievalError(
+                    "embedding_failed", "Unexpected embedding batch size."
+                )
             for key, row in zip(pending, vectors):
                 self._query_embedding_cache[key] = np.asarray(
                     row, dtype="float32"

@@ -2,6 +2,18 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from app.llm import ollama_client
+
+PROVIDER_NAME = "Ollama"
+# Inbound request ``tender`` keys for each published result field.
+REQUEST_TENDER_FIELDS = {
+    "title": "tenderName",
+    "customerName": "customer",
+    "tenderReference": "tenderReference",
+    "submissionDeadline": "submissionDeadline",
+    "summary": "summary",
+}
+
 
 def confidence_to_score(value):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -48,10 +60,24 @@ def format_evidence_match(evidence_match):
         ),
     }
 
+def _tender_result_fields(tender, tender_summary):
+    """Request-supplied values win; document-derived values fill the gaps."""
+    summary = tender_summary if isinstance(tender_summary, dict) else {}
+    fields = {}
+    for field, request_key in REQUEST_TENDER_FIELDS.items():
+        value = tender.get(request_key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            derived = summary.get(field)
+            value = derived if isinstance(derived, str) and derived.strip() else None
+        fields[field] = value
+    return fields
+
+
 def build_completed_response(
     request_message,
     requirements,
     tender_metadata=None,
+    tender_summary=None,
 ):
     documents = request_message.get("documents", [])
     document_ids = [
@@ -62,6 +88,7 @@ def build_completed_response(
 
     tender = request_message.get("tender") or {}
     metadata = tender_metadata or {}
+    tender_fields = _tender_result_fields(tender, tender_summary)
 
     formatted_requirements = []
 
@@ -122,15 +149,15 @@ def build_completed_response(
             .replace("+00:00", "Z")
         ),
         "processedDocumentIds": document_ids,
-        "providerName": "Ollama",
-        "modelName": "qwen3:8b",
-        "promptVersion": "rfp-extraction-v1",
+        "providerName": PROVIDER_NAME,
+        "modelName": ollama_client.MODEL_NAME,
+        "promptVersion": ollama_client.EXTRACTION_PROMPT_VERSION,
         "result": {
-            "title": tender.get("tenderName"),
-            "customerName": tender.get("customer"),
-            "tenderReference": tender.get("tenderReference"),
-            "submissionDeadline": tender.get("submissionDeadline"),
-            "summary": tender.get("summary"),
+            "title": tender_fields["title"],
+            "customerName": tender_fields["customerName"],
+            "tenderReference": tender_fields["tenderReference"],
+            "submissionDeadline": tender_fields["submissionDeadline"],
+            "summary": tender_fields["summary"],
             "extractedMetadata": metadata,
             "requirements": formatted_requirements,
         },

@@ -16,6 +16,14 @@ def debug_response_path(tmp_path, monkeypatch):
         "DEBUG_RESPONSE_PATH",
         tmp_path / "actual_response.json",
     )
+    monkeypatch.setattr(
+        consumer,
+        "COMPLETION_LEDGER_PATH",
+        tmp_path / "completed_deliveries.json",
+    )
+    monkeypatch.setattr(
+        consumer, "summarize_tender_document", lambda *args, **kwargs: {}
+    )
 
 
 def test_log_inbound_body_reports_bytes_and_requirement_count(capsys):
@@ -113,11 +121,22 @@ def test_successful_processing_acknowledges_request(
         "Three-year warranty required"
     )
     assert completed["result"]["requirements"][0]["mandatory"] is True
+    assert [item["fileName"] for item in completed["exportFiles"]] == [
+        "tender-export.xlsx",
+        "tender-export.docx",
+    ]
+    for item in completed["exportFiles"]:
+        assert set(item) == {"fileName", "downloadUrl"}
+        assert item["downloadUrl"].startswith(
+            "https://download.example.invalid/exports/"
+        )
+        assert item["downloadUrl"].endswith("/" + item["fileName"])
     assert completed["eventId"]
     datetime.fromisoformat(completed["completedAt"].replace("Z", "+00:00"))
     # Debug artifact mirrors the published fresh response, not a prior run.
     saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
     assert saved["eventType"] == "RFP_ANALYSIS_COMPLETED"
+    assert saved["exportFiles"] == completed["exportFiles"]
     assert len(saved["result"]["requirements"]) == 1
     assert saved["result"]["requirements"][0]["content"] == (
         "Three-year warranty required"

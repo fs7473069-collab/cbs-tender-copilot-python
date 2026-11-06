@@ -1,12 +1,11 @@
 
-from pathlib import Path
-
 from app.document.chunker import create_chunks
 from app.document.docx_processor import extract_docx_text
 from app.document.pdf_processor import extract_pdf_text
+from app.rag.retriever import KB_DIR as INDEX_DIR
 from app.rag.retriever import TenderRetriever
 
-KB_DIR = Path("local_data/cbs_knowledge_base/documents")
+KB_DIR = INDEX_DIR / "documents"
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
 
 

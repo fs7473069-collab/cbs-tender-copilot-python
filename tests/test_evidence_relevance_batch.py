@@ -218,7 +218,10 @@ def test_matcher_does_not_cache_or_accept_unassessed_timeout(monkeypatch, tmp_pa
     results = matcher.match_requirements(
         ["Provide fleet vehicle tracking."], top_k=1
     )
-    assert results[0]["status"] == "NOT_FOUND"
+    # An unassessed candidate means absence of evidence was not established.
+    assert results[0]["status"] == "NOT_CHECKED"
+    assert results[0]["retrieval"]["status"] == "OK"
+    assert results[0]["relevance"] == {"status": "INCOMPLETE", "unassessed": 1}
     assert results[0]["evidence"] == []
     assert matcher._cache == {}
 

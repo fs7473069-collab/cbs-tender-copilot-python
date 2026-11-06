@@ -1,15 +1,24 @@
+import functools
 import json
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from pika.exceptions import AMQPError
+from pika.exceptions import AMQPChannelError, AMQPConnectionError, AMQPError
 
+from app.export.local_export import (
+    LocalExportError,
+    attach_export_files,
+    upload_analysis_exports,
+)
 from app.messaging.rabbitmq import create_connection
 from app.storage.s3_client import download_file
 from app.orchestration.service import process_tender_document
+from app.orchestration.tender_summary import summarize_tender_document
 from app.response.response_builder import build_completed_response
 from app.messaging.publisher import publish_message
 
@@ -22,6 +31,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEBUG_RESPONSE_PATH = (
     PROJECT_ROOT / "local_data" / "analysis" / "actual_response.json"
 )
+# Durable record of requests whose completion response was confirmed by the
+# broker, so a redelivery is acknowledged instead of processed and published
+# twice. Holds IDs and counts only, never tender content.
+COMPLETION_LEDGER_PATH = (
+    PROJECT_ROOT / "local_data" / "messaging" / "completed_deliveries.json"
+)
+COMPLETION_LEDGER_MAX = 1000
+RECONNECT_DELAY_SECONDS = 5
+RECONNECT_DELAY_MAX_SECONDS = 60
+
+ACK = "ack"
+REQUEUE = "requeue"
+REJECT = "reject"
+# Export events (RFP_EXPORT_REQUESTED etc.) belong to the export worker.
+EXPORT_EVENT_PREFIX = "RFP_EXPORT_"
+
+_LEDGER_LOCK = threading.Lock()
 
 
 def _build_completed_status_event(message, document):
@@ -106,7 +132,107 @@ def _log_inbound_body(body):
     return message
 
 
-def callback(ch, method, properties, body):
+def _is_export_event(message):
+    event_type = message.get("eventType")
+    return isinstance(event_type, str) and event_type.strip().upper().startswith(
+        EXPORT_EVENT_PREFIX
+    )
+
+
+def _delivery_key(message):
+    """Idempotency key from request IDs; None when there is no jobId."""
+    job_id = message.get("jobId")
+    if not isinstance(job_id, str) or not job_id.strip():
+        return None
+    return "|".join(
+        str(message.get(field) or "")
+        for field in ("jobId", "analysisId", "eventId", "attempt")
+    )
+
+
+def _load_completion_ledger():
+    try:
+        data = json.loads(COMPLETION_LEDGER_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        # Unreadable ledger: duplicates are possible, so say so loudly.
+        print(
+            "Completion ledger unreadable; duplicate detection disabled "
+            f"for this lookup: {type(exc).__name__}",
+            flush=True,
+        )
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _find_completed_delivery(key):
+    if key is None:
+        return None
+    with _LEDGER_LOCK:
+        return _load_completion_ledger().get(key)
+
+
+def _record_completed_delivery(key, response):
+    if key is None:
+        return
+    with _LEDGER_LOCK:
+        ledger = _load_completion_ledger()
+        ledger[key] = {
+            "jobId": response.get("jobId"),
+            "responseEventId": response.get("eventId"),
+            "requirementCount": len(
+                (response.get("result") or {}).get("requirements") or []
+            ),
+            "publishedAt": (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            ),
+        }
+        while len(ledger) > COMPLETION_LEDGER_MAX:
+            ledger.pop(next(iter(ledger)))
+        COMPLETION_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = COMPLETION_LEDGER_PATH.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(ledger, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(COMPLETION_LEDGER_PATH)
+
+
+def _evidence_status_counts(requirements):
+    counts = {}
+    for requirement in requirements:
+        evidence_match = (
+            requirement.get("evidence_match")
+            if isinstance(requirement, dict) else None
+        )
+        status = (
+            evidence_match.get("status")
+            if isinstance(evidence_match, dict) else "MISSING"
+        )
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _tender_summary(local_path, message):
+    """Document-derived cover details; a failure leaves the fields null."""
+    try:
+        return summarize_tender_document(
+            local_path, request_tender=message.get("tender")
+        )
+    except Exception as exc:
+        print(
+            "Tender summary unavailable "
+            f"({type(exc).__name__}); summary fields left null."
+        )
+        return None
+
+
+def process_delivery(body, redelivered):
+    """Process one request and return how it must be settled.
+
+    Never touches the channel, so it is safe to run off the connection thread.
+    """
     try:
         message = _log_inbound_body(body)
 
@@ -114,6 +240,27 @@ def callback(ch, method, properties, body):
         print("eventType:", message.get("eventType"))
         print("jobId:", message.get("jobId"))
         print("eventId:", message.get("eventId"))
+        print("redelivered:", bool(redelivered))
+
+        if _is_export_event(message):
+            print(
+                "Export event received on the analysis queue; it is not an "
+                "analysis request. Rejecting without requeue and without "
+                "analysis or publishing. Send exports to "
+                "RABBITMQ_EXPORT_REQUEST_QUEUE."
+            )
+            return REJECT
+
+        delivery_key = _delivery_key(message)
+        completed = _find_completed_delivery(delivery_key)
+        if completed is not None:
+            print(
+                "Duplicate delivery: completion response already published "
+                f"(responseEventId={completed.get('responseEventId')}, "
+                f"publishedAt={completed.get('publishedAt')}). "
+                "Acknowledging without reprocessing or republishing."
+            )
+            return ACK
 
         documents = message.get("documents", [])
 
@@ -147,17 +294,15 @@ def callback(ch, method, properties, body):
         requirements = process_tender_document(local_path)
 
         print(f"Extracted {len(requirements)} requirements")
-        with_evidence = sum(
-            1
-            for requirement in requirements
-            if isinstance(requirement, dict)
-            and "evidence_match" in requirement
+        print(
+            "Evidence match statuses:",
+            json.dumps(_evidence_status_counts(requirements), sort_keys=True),
         )
-        print(f"Requirements containing RAG evidence: {with_evidence}")
 
         response = build_completed_response(
             request_message=message,
             requirements=requirements,
+            tender_summary=_tender_summary(local_path, message),
         )
         response_requirements = (
             (response.get("result") or {}).get("requirements") or []
@@ -168,7 +313,28 @@ def callback(ch, method, properties, body):
                 "fresh extraction results."
             )
 
+        # Validate request IDs before uploading exports or publishing.
+        status_event = _build_completed_status_event(
+            message=message,
+            document=document,
+        )
+
+        # Private S3 Excel/Word. Publish only after both uploads and both
+        # presigned URLs succeed. A failure follows the usual requeue-once
+        # policy and must not report exportFiles. Log the exception type
+        # only — never the URL, bucket, or credentials.
+        try:
+            export_files = upload_analysis_exports(response)
+            response = attach_export_files(response, export_files)
+        except Exception as exc:
+            print(
+                "Analysis export failed "
+                f"({type(exc).__name__}); completion will not be published."
+            )
+            raise LocalExportError("Analysis export failed") from None
+
         # Debug artifact only; never used as input for publishing.
+        # Saved after both uploads so it matches the published payload.
         _save_debug_response(response)
 
         print(f"\nResponse saved to: {DEBUG_RESPONSE_PATH.resolve()}")
@@ -180,77 +346,147 @@ def callback(ch, method, properties, body):
         print("Event type:", response.get("eventType"))
         print("Job ID:", response.get("jobId"))
         print("Requirement count:", len(response_requirements))
-
-        # Validate request IDs for the companion status event before publish.
-        status_event = _build_completed_status_event(
-            message=message,
-            document=document,
-        )
+        print("Analysis export files:", len(response.get("exportFiles") or []))
 
         print("\nPublishing completion response to the response queue...")
         # Publish the fresh RFP_ANALYSIS_COMPLETED payload (with requirements),
         # not a status-only shell and not a previously saved analysis file.
         publish_message(response)
         print("Completion response published successfully.")
+        try:
+            _record_completed_delivery(delivery_key, response)
+        except OSError as exc:
+            print(
+                "Completion ledger could not be written "
+                f"({type(exc).__name__}); a redelivery of this request "
+                "would be processed and published again."
+            )
         print(
             "Status companion event prepared "
             f"(not published): {status_event['eventType']}"
         )
-
-        # Acknowledge only after publishing succeeds.
-        if ch.is_open:
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            print("Request acknowledged successfully.")
-        else:
-            print(
-                "RabbitMQ channel closed before acknowledgement. "
-                "The request may be redelivered."
-            )
+        return ACK
 
     except Exception as exc:
         print(f"\nRequest processing failed: {exc}")
-
-        if not ch.is_open:
+        if redelivered:
             print(
-                "RabbitMQ channel is closed. "
-                "No acknowledgement or rejection was attempted."
+                "Request was already redelivered. "
+                "Rejecting without requeue."
             )
-            return
+            return REJECT
+        print("Requeuing request for one retry.")
+        return REQUEUE
 
+
+def settle_delivery(ch, delivery_tag, outcome):
+    """Ack/nack on the connection thread; never raises on a dead channel."""
+    if not ch.is_open:
+        print(
+            "RabbitMQ channel is closed. "
+            "No acknowledgement or rejection was attempted; "
+            "the broker will redeliver the request."
+        )
+        return False
+    try:
+        if outcome == ACK:
+            ch.basic_ack(delivery_tag=delivery_tag)
+            print("Request acknowledged successfully.")
+        else:
+            ch.basic_nack(
+                delivery_tag=delivery_tag,
+                requeue=outcome == REQUEUE,
+            )
+    except AMQPError as exc:
+        print(
+            f"Could not {outcome} the request because RabbitMQ reported "
+            f"{type(exc).__name__}: {exc}. The broker will redeliver it."
+        )
+        return False
+    return True
+
+
+def callback(ch, method, properties, body):
+    """Synchronous processing and settlement (used directly by tests)."""
+    outcome = process_delivery(body, method.redelivered)
+    settle_delivery(ch, method.delivery_tag, outcome)
+
+
+def _start_delivery_worker(connection, ch, method, body, state):
+    """Run a job off the I/O thread so heartbeats keep the connection alive."""
+    def run():
+        started = time.perf_counter()
+        outcome = process_delivery(body, method.redelivered)
+        print(
+            f"Request finished in {time.perf_counter() - started:.1f}s; "
+            f"outcome={outcome}",
+            flush=True,
+        )
         try:
-            if method.redelivered:
-                print(
-                    "Request was already redelivered. "
-                    "Rejecting without requeue."
+            connection.add_callback_threadsafe(
+                functools.partial(
+                    settle_delivery, ch, method.delivery_tag, outcome
                 )
-                ch.basic_nack(
-                    delivery_tag=method.delivery_tag,
-                    requeue=False,
-                )
-            else:
-                print("Requeuing request for one retry.")
-                ch.basic_nack(
-                    delivery_tag=method.delivery_tag,
-                    requeue=True,
-                )
-
-        except AMQPError as nack_error:
+            )
+        except AMQPError as exc:
             print(
-                "Could not reject/requeue the request because "
-                f"RabbitMQ reported an error: {nack_error}"
+                "RabbitMQ connection closed before settlement "
+                f"({type(exc).__name__}); the broker will redeliver the "
+                "request and the completion ledger prevents a duplicate "
+                "publish."
             )
 
+    worker = threading.Thread(target=run, name="rfp-delivery", daemon=True)
+    state["worker"] = worker
+    worker.start()
 
-def start_consumer():
+
+def _wait_for_worker(state):
+    worker = state.get("worker")
+    if worker is not None and worker.is_alive():
+        # Reconnecting now would let the broker redeliver the same request
+        # while it is still being processed.
+        print("Waiting for the in-flight request to finish before reconnecting...")
+        worker.join()
+    state["worker"] = None
+
+
+def _log_knowledge_base_status():
+    try:
+        from app.rag.retriever import TenderRetriever
+
+        status = TenderRetriever().status()
+    except Exception as exc:
+        print(
+            "Evidence knowledge base status: unavailable "
+            f"({type(exc).__name__})"
+        )
+        return
+    if status["available"]:
+        print(
+            "Evidence knowledge base status: available "
+            f"chunks={status['chunks']} dimension={status['dimension']}"
+        )
+    else:
+        print(
+            "WARNING: evidence knowledge base unavailable "
+            f"(code={status['error_code']}); requirements will be marked "
+            "NOT_CHECKED. Build it with: python -m app.rag.ingest"
+        )
+
+
+def _consume(state):
     connection = create_connection()
-
+    state["connected"] = True
     try:
         channel = connection.channel()
         channel.basic_qos(prefetch_count=1)
 
         channel.basic_consume(
             queue=QUEUE,
-            on_message_callback=callback,
+            on_message_callback=lambda ch, method, properties, body: (
+                _start_delivery_worker(connection, ch, method, body, state)
+            ),
             auto_ack=False,
         )
 
@@ -258,13 +494,42 @@ def start_consumer():
         print("Press Ctrl+C to stop the consumer.")
 
         channel.start_consuming()
-
-    except KeyboardInterrupt:
-        print("\nConsumer stopped by user.")
-
     finally:
         if connection.is_open:
-            connection.close()
+            try:
+                connection.close()
+            except AMQPError:
+                pass
+
+
+def start_consumer():
+    _log_knowledge_base_status()
+    state = {"worker": None}
+    delay = RECONNECT_DELAY_SECONDS
+
+    while True:
+        try:
+            _consume(state)
+            return
+        except KeyboardInterrupt:
+            print("\nConsumer stopped by user.")
+            worker = state.get("worker")
+            if worker is not None and worker.is_alive():
+                print(
+                    "An in-flight request was not acknowledged; "
+                    "the broker will redeliver it."
+                )
+            return
+        except (AMQPConnectionError, AMQPChannelError) as exc:
+            if state.pop("connected", False):
+                delay = RECONNECT_DELAY_SECONDS
+            print(
+                f"\nRabbitMQ connection lost: {type(exc).__name__}: {exc}"
+            )
+            _wait_for_worker(state)
+            print(f"Reconnecting in {delay}s...")
+            time.sleep(delay)
+            delay = min(delay * 2, RECONNECT_DELAY_MAX_SECONDS)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from diagnostics.ownership_extract_quality import check_pricing_engine_ownership
 
 
@@ -131,6 +133,10 @@ def test_pricing_check_ignores_generic_all_options_and_other_rows():
     ]
 
 
+@pytest.mark.skipif(
+    not BASELINE_PATH.is_file(),
+    reason="local-only asset absent: diagnostics/extract_ownership_chunk_baseline.json",
+)
 def test_historical_baseline_fails_pricing_option_c_check():
     """Older CPU baseline extract omitted Pricing Option C; validator must catch it."""
     baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
@@ -144,6 +150,10 @@ def test_historical_baseline_fails_pricing_option_c_check():
     assert baseline_check["assignments"]["option_c_vendor"]["present"] is False
 
 
+@pytest.mark.skipif(
+    not TWO_RUN_PATH.is_file(),
+    reason="local-only asset absent: diagnostics/extract_ownership_chunk_two_run.json",
+)
 def test_latest_two_run_passes_pricing_option_abc_check():
     """Latest live two-run extracts preserve Pricing A/B/C ownership."""
     two_run = json.loads(TWO_RUN_PATH.read_text(encoding="utf-8"))

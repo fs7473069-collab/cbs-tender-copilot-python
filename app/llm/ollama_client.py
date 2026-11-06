@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import re
+import threading
 import time
 
 import requests
@@ -13,6 +14,16 @@ OLLAMA_URL = os.getenv(
     "http://localhost:11434/api/generate",
 )
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+# Bump when the extract_requirements prompt or its output rules change.
+EXTRACTION_PROMPT_VERSION = "rfp-extraction-v1"
+TENDER_SUMMARY_PROMPT_VERSION = "tender-summary-v1"
+TENDER_SUMMARY_FIELDS = (
+    "title",
+    "customerName",
+    "tenderReference",
+    "submissionDeadline",
+    "summary",
+)
 # Caps runaway decoding on CPU; typical extraction responses are far smaller.
 EXTRACT_NUM_PREDICT = int(os.getenv("OLLAMA_EXTRACT_NUM_PREDICT", "1536"))
 # Optional CPU thread hint for Ollama. 0 leaves Ollama's default.
@@ -101,16 +112,29 @@ _TOC_DOTTED_MIN_HITS = 3
 # often repeats banners). Bounded to avoid unbounded growth on long consumers.
 _EXTRACT_RESULT_CACHE = {}
 _EXTRACT_RESULT_CACHE_MAX = 256
+# Chunk extraction may run in worker threads; guards cache reads and writes.
+_EXTRACT_RESULT_CACHE_LOCK = threading.Lock()
 
 # Last /api/generate metrics (done_reason, response_chars) for batch diagnostics.
-_LAST_GENERATE_METRICS = {}
+# Thread-local so concurrent generates never overwrite each other's metrics.
+_GENERATE_METRICS_LOCAL = threading.local()
 # Leaf multi-pair batch diagnostic events (benchmark / offline inspection).
 _BATCH_DIAGNOSTIC_EVENTS = []
 
 
+def get_last_generate_metrics():
+    """Return a copy of the calling thread's most recent generate metrics."""
+    return dict(getattr(_GENERATE_METRICS_LOCAL, "metrics", {}))
+
+
+def _clear_last_generate_metrics():
+    _GENERATE_METRICS_LOCAL.metrics = {}
+
+
 def clear_extract_requirements_cache():
     """Clear the in-process identical-chunk extraction cache (tests/helpers)."""
-    _EXTRACT_RESULT_CACHE.clear()
+    with _EXTRACT_RESULT_CACHE_LOCK:
+        _EXTRACT_RESULT_CACHE.clear()
 
 
 def clear_batch_diagnostic_events():
@@ -177,14 +201,13 @@ def _log_generate_metrics(
         tokens_per_second = round(eval_count / (eval_duration / 1e9), 3)
     response_chars = len(body.get("response") or "")
     done_reason = body.get("done_reason")
-    _LAST_GENERATE_METRICS.clear()
-    _LAST_GENERATE_METRICS.update({
+    _GENERATE_METRICS_LOCAL.metrics = {
         "label": label,
         "done_reason": done_reason,
         "response_chars": response_chars,
         "wall_seconds": round(wall_seconds, 3),
         "eval_count": eval_count,
-    })
+    }
     print(
         "OLLAMA_GENERATE "
         f"label={label} model={model or MODEL_NAME} wall_s={wall_seconds:.3f} "
@@ -265,7 +288,10 @@ def extract_requirements(chunk):
         return {"requirements": []}
 
     cache_key = normalize_chunk_text(tender_text)
-    cached = _EXTRACT_RESULT_CACHE.get(cache_key)
+    with _EXTRACT_RESULT_CACHE_LOCK:
+        cached = _EXTRACT_RESULT_CACHE.get(cache_key)
+        if cached is not None:
+            cached = copy.deepcopy(cached)
     if cached is not None:
         print(
             "OLLAMA_GENERATE skipped extract_requirements "
@@ -273,7 +299,7 @@ def extract_requirements(chunk):
             f"chars={len(cache_key)}",
             flush=True,
         )
-        return copy.deepcopy(cached)
+        return cached
 
     prompt = f"""
 You are a careful tender requirement extraction system.
@@ -431,11 +457,76 @@ TENDER TEXT:
         )
 
     result = {"requirements": validated_requirements}
-    if len(_EXTRACT_RESULT_CACHE) >= _EXTRACT_RESULT_CACHE_MAX:
-        # Drop an arbitrary old entry; exact LRU is unnecessary for this cache.
-        _EXTRACT_RESULT_CACHE.pop(next(iter(_EXTRACT_RESULT_CACHE)))
-    _EXTRACT_RESULT_CACHE[cache_key] = result
-    return copy.deepcopy(result)
+    with _EXTRACT_RESULT_CACHE_LOCK:
+        if (
+            cache_key not in _EXTRACT_RESULT_CACHE
+            and len(_EXTRACT_RESULT_CACHE) >= _EXTRACT_RESULT_CACHE_MAX
+        ):
+            # Drop an arbitrary old entry; exact LRU is unnecessary for this cache.
+            _EXTRACT_RESULT_CACHE.pop(next(iter(_EXTRACT_RESULT_CACHE)))
+        _EXTRACT_RESULT_CACHE[cache_key] = copy.deepcopy(result)
+    return result
+
+
+def extract_tender_summary(tender_text):
+    """Return explicitly stated cover details; null for anything not stated.
+
+    Callers must still verify every value against the source text.
+    """
+    if not isinstance(tender_text, str) or not tender_text.strip():
+        return {field: None for field in TENDER_SUMMARY_FIELDS}
+
+    prompt = f"""
+You extract cover details from the opening pages of a tender document.
+
+Return ONLY valid JSON. Do not explain or include markdown.
+
+RULES:
+- Use only the TENDER TEXT below. Never guess or use outside knowledge.
+- Copy every value exactly as it is written in the text.
+- title: the tender or project name as printed.
+- customerName: the organisation issuing the tender, as printed.
+- tenderReference: the tender, notice, or reference number as printed.
+- submissionDeadline: the bid submission deadline date and time as printed.
+- summary: one or two sentences copied from the text that state what is
+  being procured or the scope of work.
+- Use null for any field that is not explicitly stated in the text.
+
+JSON FORMAT:
+{{
+  "title": null,
+  "customerName": null,
+  "tenderReference": null,
+  "submissionDeadline": null,
+  "summary": null
+}}
+
+TENDER TEXT:
+{tender_text}
+"""
+
+    response_text = generate_response(
+        prompt,
+        num_predict=512,
+        timeout=180,
+        label="extract_tender_summary",
+    )
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Ollama returned invalid JSON for tender summary extraction."
+        ) from exc
+    if not isinstance(result, dict):
+        raise ValueError("Tender summary extraction must return a JSON object.")
+    return {
+        field: (
+            result[field].strip()
+            if isinstance(result.get(field), str) and result[field].strip()
+            else None
+        )
+        for field in TENDER_SUMMARY_FIELDS
+    }
 
 
 def assess_evidence_relevance(requirement, evidence_text):
@@ -706,9 +797,10 @@ def _parseable_assessment_count(assessments):
 
 def _done_reason_for_batch_label():
     """Return done_reason from the last generate if it was a batch call."""
-    if _LAST_GENERATE_METRICS.get("label") != "assess_evidence_relevance_batch":
+    metrics = get_last_generate_metrics()
+    if metrics.get("label") != "assess_evidence_relevance_batch":
         return None
-    return _LAST_GENERATE_METRICS.get("done_reason")
+    return metrics.get("done_reason")
 
 
 def _record_batch_diagnostic_event(
@@ -989,7 +1081,7 @@ PAIRS:
 
     try:
         # Avoid attributing a prior generate's done_reason to this batch leaf.
-        _LAST_GENERATE_METRICS.clear()
+        _clear_last_generate_metrics()
         response_text = generate_response(
             prompt,
             num_predict=num_predict,

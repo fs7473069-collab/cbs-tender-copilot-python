@@ -10,7 +10,7 @@ import requests
 from app.llm.ollama_client import MODEL_NAME
 from app.llm.ollama_client import assess_evidence_relevance
 from app.llm.ollama_client import assess_evidence_relevance_batch
-from app.rag.retriever import KB_DIR, TenderRetriever
+from app.rag.retriever import KB_DIR, RetrievalError, TenderRetriever
 
 
 RELEVANCE_CONFIG_VERSION = "lexical-prefilter-v2|relevance-prompt-v1"
@@ -91,6 +91,95 @@ def prefilter_candidate(requirement_text, evidence_text):
 def _normalize_requirement_key(text):
     """Stable key for in-run reuse of identical requirement wording."""
     return " ".join(text.casefold().split())
+
+
+RETRIEVAL_OK = {"status": "OK"}
+MATCH_NOTE = (
+    "Evidence passed similarity, conservative lexical filtering, "
+    "and topical relevance checks but still requires human "
+    "verification. It does not prove compliance."
+)
+
+
+def _evidence_item(candidate, assessment):
+    return {
+        "text": candidate["text"],
+        "source": candidate["source"],
+        "page": candidate["page"],
+        "similarity": candidate["score"],
+        "kb_chunk_id": candidate.get("kb_chunk_id"),
+        "relevance_reason": (assessment or {}).get("reason", ""),
+    }
+
+
+def _match_result(requirement_text, evidence, unassessed, min_similarity, timings):
+    """Final status for a search that ran.
+
+    With no accepted evidence, candidates whose relevance check never
+    completed (timeout, model error) make the outcome ``NOT_CHECKED``: absence
+    of evidence was not established, so it must not read as ``NOT_FOUND``.
+    """
+    if evidence:
+        status, note = "REVIEW_REQUIRED", MATCH_NOTE
+    elif unassessed:
+        status = "NOT_CHECKED"
+        note = (
+            f"Relevance assessment did not complete for {unassessed} "
+            "retrieved candidate(s); the requirement was not fully checked "
+            "against the knowledge base."
+        )
+    else:
+        status, note = "NOT_FOUND", MATCH_NOTE
+    return {
+        "requirement": requirement_text,
+        "status": status,
+        "evidence": evidence,
+        "note": note,
+        "min_similarity": min_similarity,
+        "timings": timings,
+        "retrieval": dict(RETRIEVAL_OK),
+        "relevance": {
+            "status": "INCOMPLETE" if status == "NOT_CHECKED" else "COMPLETE",
+            "unassessed": unassessed,
+        },
+    }
+
+
+def _is_complete(result):
+    return (result.get("relevance") or {}).get("status") != "INCOMPLETE"
+
+
+def retrieval_failure_match(requirement_text, exc, min_similarity=None):
+    """Evidence result for a search that could not run.
+
+    ``NOT_CHECKED`` (never ``NOT_FOUND``) so consumers cannot mistake an
+    unavailable knowledge base for a genuine absence of evidence.
+    """
+    code = getattr(exc, "code", None) or "retriever_exception"
+    return {
+        "requirement": requirement_text,
+        "status": "NOT_CHECKED",
+        "evidence": [],
+        "note": (
+            f"Evidence retrieval unavailable ({code}); the requirement was "
+            f"not checked against the knowledge base. {exc}"
+        ),
+        "min_similarity": min_similarity,
+        "retrieval": {
+            "status": "FAILED",
+            "error_code": code,
+            "error_type": type(exc).__name__,
+        },
+    }
+
+
+def _log_retrieval_failure(exc, requirement_count):
+    print(
+        "EVIDENCE_RETRIEVAL status=FAILED "
+        f"code={getattr(exc, 'code', None) or 'retriever_exception'} "
+        f"error_type={type(exc).__name__} requirements={requirement_count}",
+        flush=True,
+    )
 
 
 class RequirementEvidenceMatcher:
@@ -208,6 +297,7 @@ class RequirementEvidenceMatcher:
         evidence, llm_seconds = [], 0.0
         filtered, cache_hits, relevance_calls = 0, 0, 0
         skipped_after_accept = 0
+        unassessed = 0
         for item in candidates:
             if len(evidence) >= self.max_accepted_evidence:
                 # Remaining candidates are not needed for REVIEW_REQUIRED.
@@ -228,17 +318,14 @@ class RequirementEvidenceMatcher:
                 relevance_calls += int(not cache_hit)
                 llm_seconds += elapsed
             except (ValueError, OSError, requests.RequestException):
-                filtered += 1
+                unassessed += 1
+                continue
+            if assessment.get("unassessed"):
+                unassessed += 1
                 continue
             if not assessment["relevant"]:
                 continue
-            evidence.append({
-                "text": item["text"],
-                "source": item["source"],
-                "page": item["page"],
-                "similarity": item["score"],
-                "relevance_reason": assessment.get("reason", ""),
-            })
+            evidence.append(_evidence_item(item, assessment))
 
         timings = dict(metrics or {})
         timings.update({
@@ -249,18 +336,9 @@ class RequirementEvidenceMatcher:
             "relevance_cache_hits": cache_hits,
             "candidates_skipped_after_accept": skipped_after_accept,
         })
-        return {
-            "requirement": requirement_text,
-            "status": "REVIEW_REQUIRED" if evidence else "NOT_FOUND",
-            "evidence": evidence,
-            "note": (
-                "Evidence passed similarity, conservative lexical filtering, "
-                "and topical relevance checks but still requires human "
-                "verification. It does not prove compliance."
-            ),
-            "min_similarity": self.min_similarity,
-            "timings": timings,
-        }
+        return _match_result(
+            requirement_text, evidence, unassessed, self.min_similarity, timings
+        )
 
     def match_requirement(self, requirement, top_k=3, *, retrieved=None):
         requirement_text = self._requirement_text(requirement)
@@ -280,18 +358,17 @@ class RequirementEvidenceMatcher:
                     "query_embedding_seconds": None,
                     "retrieval_seconds": None,
                 }
-        except RuntimeError as exc:
-            return {
-                "requirement": requirement_text,
-                "status": "NOT_FOUND",
-                "evidence": [],
-                "note": f"Evidence matching was not run: {exc}",
-                "min_similarity": self.min_similarity,
-            }
+        except Exception as exc:
+            # Not memoized: a later call may succeed once retrieval recovers.
+            _log_retrieval_failure(exc, 1)
+            return retrieval_failure_match(
+                requirement_text, exc, self.min_similarity
+            )
 
         try:
             result = self._match_candidates(requirement_text, candidates, metrics)
-            self._match_memo[memo_key] = result
+            if _is_complete(result):
+                self._match_memo[memo_key] = result
             return result
         finally:
             # Durable after each requirement so interrupted chunk rematches
@@ -345,16 +422,21 @@ class RequirementEvidenceMatcher:
                     candidates, metrics = self._retrieve_one(text, top_k)
                     candidates_list.append(candidates)
                     metrics_list.append(metrics)
-        except RuntimeError as exc:
-            note = f"Evidence matching was not run: {exc}"
+            if (
+                len(candidates_list) != len(pending_texts)
+                or len(metrics_list) != len(pending_texts)
+            ):
+                raise RetrievalError(
+                    "retrieval_count_mismatch",
+                    "Retriever returned a result count that does not match "
+                    "the number of queries.",
+                )
+        except Exception as exc:
+            _log_retrieval_failure(exc, len(pending_texts))
             for index, text in zip(pending_indices, pending_texts):
-                results[index] = {
-                    "requirement": text,
-                    "status": "NOT_FOUND",
-                    "evidence": [],
-                    "note": note,
-                    "min_similarity": self.min_similarity,
-                }
+                results[index] = retrieval_failure_match(
+                    text, exc, self.min_similarity
+                )
             return results
 
         try:
@@ -386,6 +468,7 @@ class RequirementEvidenceMatcher:
                     "relevance_calls": 0,
                     "llm_seconds": 0.0,
                     "skipped_after_accept": 0,
+                    "unassessed": 0,
                     "done": False,
                 })
 
@@ -458,19 +541,14 @@ class RequirementEvidenceMatcher:
                         state["relevance_calls"] += 1
                         state["llm_seconds"] += float(job.get("llm_elapsed") or 0.0)
                     # Unassessed (e.g. batch timeout) is never accepted evidence.
-                    if (
-                        not assessment
-                        or assessment.get("unassessed")
-                        or not assessment.get("relevant")
-                    ):
+                    if not assessment or assessment.get("unassessed"):
+                        state["unassessed"] += 1
                         continue
-                    state["evidence"].append({
-                        "text": job["item"]["text"],
-                        "source": job["item"]["source"],
-                        "page": job["item"]["page"],
-                        "similarity": job["item"]["score"],
-                        "relevance_reason": (assessment or {}).get("reason", ""),
-                    })
+                    if not assessment.get("relevant"):
+                        continue
+                    state["evidence"].append(
+                        _evidence_item(job["item"], assessment)
+                    )
 
             for state in states:
                 if state["cursor"] < len(state["candidates"]) and len(
@@ -480,12 +558,19 @@ class RequirementEvidenceMatcher:
                         len(state["candidates"]) - state["cursor"]
                     )
                 result = self._result_from_state(state)
-                self._match_memo[_normalize_requirement_key(state["text"])] = result
+                memo_key = _normalize_requirement_key(state["text"])
+                if _is_complete(result):
+                    self._match_memo[memo_key] = result
                 results[state["index"]] = result
+            primary_results = {
+                _normalize_requirement_key(state["text"]): results[state["index"]]
+                for state in states
+            }
             for index, memo_key in duplicate_indexes:
-                cached_match = self._match_memo.get(memo_key)
-                if cached_match is not None:
-                    results[index] = json.loads(json.dumps(cached_match))
+                # Incomplete results are not memoized, so copy the primary's.
+                source = primary_results.get(memo_key) or self._match_memo.get(memo_key)
+                if source is not None:
+                    results[index] = json.loads(json.dumps(source))
         finally:
             self._flush_cache_if_dirty()
         return results
@@ -540,15 +625,10 @@ class RequirementEvidenceMatcher:
             "relevance_cache_hits": state["cache_hits"],
             "candidates_skipped_after_accept": state["skipped_after_accept"],
         })
-        return {
-            "requirement": state["text"],
-            "status": "REVIEW_REQUIRED" if state["evidence"] else "NOT_FOUND",
-            "evidence": state["evidence"],
-            "note": (
-                "Evidence passed similarity, conservative lexical filtering, "
-                "and topical relevance checks but still requires human "
-                "verification. It does not prove compliance."
-            ),
-            "min_similarity": self.min_similarity,
-            "timings": timings,
-        }
+        return _match_result(
+            state["text"],
+            state["evidence"],
+            state["unassessed"],
+            self.min_similarity,
+            timings,
+        )

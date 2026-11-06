@@ -28,7 +28,22 @@ services:
       - agent_data:/app/data
       - agent_chunks:/app/chunks
 
+  # Optional tender export worker (PROPOSED contract, see docs/export_contract.md).
+  # Not started by a plain `docker compose up`; opt in with
+  # `docker compose --profile export up -d export-worker`.
+  export-worker:
+    build: .
+    container_name: rfp-export-worker
+    profiles: ["export"]
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "-m", "app.messaging.export_consumer"]
+    volumes:
+      # Persists the exportId idempotency ledger across container restarts.
+      - export_ledger:/app/local_data/messaging
+
 volumes:
   ollama_data:
   agent_data:
   agent_chunks:
+  export_ledger:

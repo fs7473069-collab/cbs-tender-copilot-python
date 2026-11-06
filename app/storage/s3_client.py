@@ -1,3 +1,4 @@
+import hashlib
 import os
 
 import boto3
@@ -41,4 +42,50 @@ def upload_file(local_path, bucket, key):
     return key
 
 
+def upload_bytes(data, bucket, key, content_type):
+    """Upload an in-memory object; returns bucket, key, size and SHA-256."""
+    if not bucket or not key:
+        raise ValueError("S3 bucket and key are required for upload")
 
+    s3 = create_s3_client()
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+
+    return {
+        "bucket": bucket,
+        "key": key,
+        "contentType": content_type,
+        "sizeBytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def create_presigned_download_url(bucket, key, expires_in):
+    """Presigned GET for a private object.
+
+    Does not set a canned ACL, public-read, or object ACL. The bucket stays
+    private; the URL is the only access, and only until it expires.
+    """
+    if not bucket or not key:
+        raise ValueError("S3 bucket and key are required for a download URL")
+    if (
+        isinstance(expires_in, bool)
+        or not isinstance(expires_in, int)
+        or expires_in <= 0
+    ):
+        raise ValueError("Presigned URL expiry must be a positive integer")
+
+    s3 = create_s3_client()
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_in,
+    )
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("Presigned download URL was empty")
+    return url
