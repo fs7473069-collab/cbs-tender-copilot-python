@@ -12,6 +12,7 @@ import app.orchestration.tender_summary as tender_summary
 import app.rag.retriever as rag_module
 from app.document.structure import describe_chunk_structure, locate_requirement
 from app.export.local_export import attach_export_files
+from app.messaging.consumer import outbound_completion_payload
 from app.llm import ollama_client
 from app.rag.matcher import RequirementEvidenceMatcher
 from app.rag.retriever import RetrievalError, TenderRetriever
@@ -622,6 +623,12 @@ def test_published_schema_key_sets_are_unchanged():
         assert set(item) == {"fileName", "downloadUrl"}
     for key in TOP_LEVEL_KEYS:
         assert published[key] == response[key]
+    outbound = outbound_completion_payload(published)
+    assert "requirements" not in outbound["result"]
+    assert set(outbound["result"]) == RESULT_KEYS - {"requirements"}
+    assert outbound["exportFiles"] == published["exportFiles"]
+    assert len(published["result"]["requirements"]) == 1
+
     assert set(response["result"]) == RESULT_KEYS
     item = response["result"]["requirements"][0]
     assert set(item) == REQUIREMENT_KEYS

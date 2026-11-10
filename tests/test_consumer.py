@@ -117,10 +117,9 @@ def test_successful_processing_acknowledges_request(
     assert completed["attempt"] == 1
     assert completed["status"] == "COMPLETED"
     assert completed["processedDocumentIds"] == ["document-123", "document-456"]
-    assert completed["result"]["requirements"][0]["content"] == (
-        "Three-year warranty required"
-    )
-    assert completed["result"]["requirements"][0]["mandatory"] is True
+    assert "requirements" not in completed["result"]
+    assert completed["result"]["title"] is None
+    assert completed["result"]["extractedMetadata"] == {}
     assert [item["fileName"] for item in completed["exportFiles"]] == [
         "tender-export.xlsx",
         "tender-export.docx",
@@ -133,7 +132,7 @@ def test_successful_processing_acknowledges_request(
         assert item["downloadUrl"].endswith("/" + item["fileName"])
     assert completed["eventId"]
     datetime.fromisoformat(completed["completedAt"].replace("Z", "+00:00"))
-    # Debug artifact mirrors the published fresh response, not a prior run.
+    # Debug artifact keeps the full internal response, including requirements.
     saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
     assert saved["eventType"] == "RFP_ANALYSIS_COMPLETED"
     assert saved["exportFiles"] == completed["exportFiles"]
@@ -141,6 +140,7 @@ def test_successful_processing_acknowledges_request(
     assert saved["result"]["requirements"][0]["content"] == (
         "Three-year warranty required"
     )
+    assert saved["result"]["requirements"][0]["mandatory"] is True
     channel.basic_ack.assert_called_once_with(delivery_tag=10)
     channel.basic_nack.assert_not_called()
 
@@ -220,15 +220,15 @@ def test_published_response_uses_fresh_extraction_not_stale_debug_file(
 
     published = mock_publish.call_args.args[0]
     assert published["eventType"] == "RFP_ANALYSIS_COMPLETED"
-    assert len(published["result"]["requirements"]) == 1
-    assert published["result"]["requirements"][0]["content"] == (
-        "Fresh requirement from current extraction"
-    )
-    assert published["result"]["requirements"][0]["evidenceMatch"]["status"] == (
-        "REVIEW_REQUIRED"
-    )
+    assert "requirements" not in published["result"]
     saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
     assert len(saved["result"]["requirements"]) == 1
+    assert saved["result"]["requirements"][0]["content"] == (
+        "Fresh requirement from current extraction"
+    )
+    assert saved["result"]["requirements"][0]["evidenceMatch"]["status"] == (
+        "REVIEW_REQUIRED"
+    )
     assert "stale-0" not in json.dumps(saved)
 
 

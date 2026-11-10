@@ -21,9 +21,11 @@ from app.export.local_export import (
     EXCEL_FILENAME,
     WORD_FILENAME,
     LocalExportError,
+    attach_export_files,
     snapshot_from_completed_response,
     upload_analysis_exports,
 )
+from app.messaging.consumer import outbound_completion_payload
 from app.export.word import NO_APPROVED_SECTIONS_TEXT
 from app.messaging.export_consumer import DOCX_CONTENT_TYPE, XLSX_CONTENT_TYPE
 from app.response.response_builder import build_completed_response
@@ -462,6 +464,43 @@ def test_presign_rejects_expiry_before_creating_a_client(monkeypatch, expires_in
         s3_client.create_presigned_download_url("bucket-a", "exports/a.xlsx", expires_in)
 
 
+def test_outbound_payload_drops_only_requirements():
+    response = attach_export_files(
+        _completed(),
+        [
+            {
+                "fileName": EXCEL_FILENAME,
+                "downloadUrl": "https://download.example.invalid/tender-export.xlsx",
+            },
+            {
+                "fileName": WORD_FILENAME,
+                "downloadUrl": "https://download.example.invalid/tender-export.docx",
+            },
+        ],
+    )
+    outbound = outbound_completion_payload(response)
+
+    assert "requirements" in response["result"]
+    assert len(response["result"]["requirements"]) == 1
+    assert "requirements" not in outbound["result"]
+    assert outbound["exportFiles"] == response["exportFiles"]
+    assert set(outbound) == set(response)
+    for key in outbound:
+        if key == "result":
+            continue
+        assert outbound[key] == response[key]
+    for field in (
+        "title",
+        "customerName",
+        "tenderReference",
+        "submissionDeadline",
+        "summary",
+        "extractedMetadata",
+    ):
+        assert field in outbound["result"]
+        assert outbound["result"][field] == response["result"][field]
+
+
 # Consumer integration --------------------------------------------------------
 
 def _run(monkeypatch, message, redelivered=False, publish=None, process=None):
@@ -526,9 +565,15 @@ def test_completion_publishes_download_urls_and_keeps_analysis_fields(
     ]
     built = _completed()
     assert set(message) == set(built) | {"exportFiles"}
+    assert "requirements" not in message["result"]
     for key, value in built.items():
         if key in ("eventId", "completedAt"):
             assert message[key]
+            continue
+        if key == "result":
+            expected_result = dict(value)
+            expected_result.pop("requirements", None)
+            assert message[key] == expected_result
             continue
         assert message[key] == value
     saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
@@ -536,8 +581,79 @@ def test_completion_publishes_download_urls_and_keeps_analysis_fields(
     assert saved["result"]["requirements"][0]["content"] == (
         "Synthetic requirement for export."
     )
+    assert len(saved["result"]["requirements"]) == 1
     for probe in forbidden:
         probe.assert_not_called()
+
+
+def test_published_json_omits_requirements_and_keeps_internal_copy(
+    monkeypatch, mock_analysis_export_s3,
+):
+    extracted = [
+        {
+            "text": f"Requirement {index}",
+            "mandatory": True,
+            "confidence": "High",
+        }
+        for index in range(328)
+    ]
+    seen = []
+
+    def publish(message):
+        seen.append(message)
+
+    channel, _publish, process = _run(
+        monkeypatch,
+        _request(),
+        publish=publish,
+        process=Mock(return_value=extracted),
+    )
+
+    channel.basic_ack.assert_called_once()
+    assert process.call_count == 1
+    assert len(seen) == 1
+    published = seen[0]
+    assert published["eventType"] == "RFP_ANALYSIS_COMPLETED"
+    assert "requirements" not in published["result"]
+    for field in (
+        "schemaVersion",
+        "eventType",
+        "eventId",
+        "organizationId",
+        "workspaceId",
+        "jobId",
+        "analysisId",
+        "correlationId",
+        "attempt",
+        "status",
+        "completedAt",
+        "processedDocumentIds",
+        "providerName",
+        "modelName",
+        "promptVersion",
+    ):
+        assert field in published
+    for field in (
+        "title",
+        "customerName",
+        "tenderReference",
+        "submissionDeadline",
+        "summary",
+        "extractedMetadata",
+    ):
+        assert field in published["result"]
+    assert [item["fileName"] for item in published["exportFiles"]] == [
+        EXCEL_FILENAME,
+        WORD_FILENAME,
+    ]
+    for item in published["exportFiles"]:
+        assert set(item) == {"fileName", "downloadUrl"}
+    assert len(mock_analysis_export_s3["uploads"]) == 2
+    saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
+    assert len(saved["result"]["requirements"]) == 328
+    assert saved["result"]["requirements"][0]["content"] == "Requirement 0"
+    assert saved["result"]["requirements"][327]["content"] == "Requirement 327"
+    assert saved["exportFiles"] == published["exportFiles"]
 
 
 def test_render_failure_does_not_publish_or_ack(

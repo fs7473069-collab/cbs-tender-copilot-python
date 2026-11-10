@@ -97,6 +97,23 @@ def _build_completed_status_event(message, document):
     }
 
 
+def outbound_completion_payload(response):
+    """Copy for RabbitMQ: same completion fields, no ``result.requirements``.
+
+    The internal response is left unchanged so exports and the debug copy
+    still see every extracted requirement.
+    """
+    if not isinstance(response, dict):
+        raise ValueError("Completed response must be an object")
+    outbound = dict(response)
+    result = response.get("result")
+    if isinstance(result, dict):
+        result_copy = dict(result)
+        result_copy.pop("requirements", None)
+        outbound["result"] = result_copy
+    return outbound
+
+
 def _save_debug_response(response):
     """Atomically write the debug copy of the completed response."""
     DEBUG_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -333,9 +350,10 @@ def process_delivery(body, redelivered):
             )
             raise LocalExportError("Analysis export failed") from None
 
-        # Debug artifact only; never used as input for publishing.
-        # Saved after both uploads so it matches the published payload.
+        # Debug artifact keeps the full internal response, including
+        # requirements. The RabbitMQ payload is a separate copy.
         _save_debug_response(response)
+        outbound = outbound_completion_payload(response)
 
         print(f"\nResponse saved to: {DEBUG_RESPONSE_PATH.resolve()}")
         print(
@@ -349,9 +367,9 @@ def process_delivery(body, redelivered):
         print("Analysis export files:", len(response.get("exportFiles") or []))
 
         print("\nPublishing completion response to the response queue...")
-        # Publish the fresh RFP_ANALYSIS_COMPLETED payload (with requirements),
-        # not a status-only shell and not a previously saved analysis file.
-        publish_message(response)
+        # Publish the fresh RFP_ANALYSIS_COMPLETED payload without
+        # result.requirements. Exports already used the full internal copy.
+        publish_message(outbound)
         print("Completion response published successfully.")
         try:
             _record_completed_delivery(delivery_key, response)

@@ -25,7 +25,7 @@ def test_publish_message_sends_json_and_confirms_delivery(mock_create_connection
 
     # Verify publisher setup.
     channel.queue_declare.assert_called_once_with(
-        queue="rfp_docs_response1",
+        queue="rfp_docs_response2",
         durable=True,
     )
     channel.confirm_delivery.assert_called_once()
@@ -34,7 +34,7 @@ def test_publish_message_sends_json_and_confirms_delivery(mock_create_connection
     args, kwargs = channel.basic_publish.call_args
 
     assert kwargs["exchange"] == ""
-    assert kwargs["routing_key"] == "rfp_docs_response1"
+    assert kwargs["routing_key"] == "rfp_docs_response2"
     assert kwargs["mandatory"] is True
     assert json.loads(kwargs["body"]) == message
     assert kwargs["properties"].content_type == "application/json"

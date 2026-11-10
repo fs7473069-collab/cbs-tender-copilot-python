@@ -343,7 +343,10 @@ def test_analysis_publish_message_still_targets_analysis_queue(monkeypatch):
     ch = connection.channel.return_value
     monkeypatch.setattr(publisher, "create_connection", lambda: connection)
     publisher.publish_message({"eventType": "RFP_ANALYSIS_COMPLETED"})
-    assert ch.basic_publish.call_args.kwargs["routing_key"] == "rfp_docs_response1"
+    assert publisher.RESPONSE_QUEUE == "rfp_docs_response2"
+    assert ch.basic_publish.call_args.kwargs["routing_key"] == (
+        publisher.RESPONSE_QUEUE
+    )
 
 
 @pytest.mark.parametrize("event_type", [
@@ -456,9 +459,9 @@ def test_default_queue_configuration_is_valid():
 @pytest.mark.parametrize("request_queue, response_queue, analysis_queue, needle", [
     ("rfp-python-test", "rfp-export-responses", "rfp-python-test", "RABBITMQ_QUEUE"),
     ("same", "same", "rfp-python-test", "RABBITMQ_EXPORT_RESPONSE_QUEUE"),
-    ("rfp-export-requests", "rfp_docs_response1", "rfp-python-test", "analysis response"),
+    ("rfp-export-requests", "rfp_docs_response2", "rfp-python-test", "analysis response"),
     ("rfp-export-requests", "copilot-analysis", "copilot-analysis", "RABBITMQ_QUEUE"),
-    ("rfp_docs_response1", "rfp-export-responses", "rfp-python-test", "analysis response"),
+    ("rfp_docs_response2", "rfp-export-responses", "rfp-python-test", "analysis response"),
     (" rfp-python-test ", "rfp-export-responses", "rfp-python-test", "RABBITMQ_QUEUE"),
     ("", "rfp-export-responses", "rfp-python-test", "blank"),
     ("rfp-export-requests", "  ", "rfp-python-test", "blank"),
