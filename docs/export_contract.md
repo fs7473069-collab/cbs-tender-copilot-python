@@ -36,21 +36,27 @@ The field is additive. Existing `RFP_ANALYSIS_COMPLETED` fields are unchanged.
 attaches it only after both uploads and both presigned URLs succeed.
 
 When it appears: only on a completion that is actually published. Excel is
-first, then Word. Each entry has **only** `fileName` and `downloadUrl`.
-There is no `path`, `bucket`, or `key` in `exportFiles`. `downloadUrl` is a
-short-lived presigned GET URL for a private object. It expires. Java and the
-frontend must not treat it as a permanent link. The bucket stays private;
-objects are not given `public-read` or any ACL that makes them public.
+first, then Word. Each entry has `fileName`, `downloadUrl`, `bucket`, `key`,
+and `expiresIn`. There is no `path`. `downloadUrl` is a presigned GET URL
+for a private object. It expires. Persist `bucket` and `key`, not the URL,
+if a later download is required. The bucket stays private; objects are not
+given `public-read` or any ACL that makes them public.
 
 ```json
 "exportFiles": [
   {
     "fileName": "tender-export.xlsx",
-    "downloadUrl": "https://example.invalid/presigned-excel"
+    "downloadUrl": "https://example.invalid/presigned-excel",
+    "bucket": "export-bucket",
+    "key": "exports/org-1/ws-1/job-1/analysis-1/tender-export.xlsx",
+    "expiresIn": 345600
   },
   {
     "fileName": "tender-export.docx",
-    "downloadUrl": "https://example.invalid/presigned-word"
+    "downloadUrl": "https://example.invalid/presigned-word",
+    "bucket": "export-bucket",
+    "key": "exports/org-1/ws-1/job-1/analysis-1/tender-export.docx",
+    "expiresIn": 345600
   }
 ]
 ```
@@ -59,9 +65,12 @@ objects are not given `public-read` or any ACL that makes them public.
 |---|---|
 | `exportFiles` | Top-level on `RFP_ANALYSIS_COMPLETED`. Absent when export failed, because that completion is not published. |
 | `fileName` | Stable names: `tender-export.xlsx`, then `tender-export.docx`. No `exportId`. |
-| `downloadUrl` | Presigned S3 GET URL. Expires after `S3_PRESIGNED_URL_EXPIRES_SECONDS` (default 3600 seconds). Not a local path. |
+| `downloadUrl` | Presigned S3 GET URL. Expires after `expiresIn` seconds. Not a local path. |
+| `bucket` | Destination bucket (`S3_EXPORT_BUCKET` or `S3_BUCKET`). Durable reference. |
+| `key` | Object key. Durable reference. Same path as below. |
+| `expiresIn` | Lifetime of `downloadUrl` in seconds. Default `345600` (4 days). |
 
-Object keys are not included in the response. They are:
+Object keys:
 
 ```text
 exports/{organizationId}/{workspaceId}/{jobId}/{analysisId}/tender-export.xlsx
@@ -83,7 +92,7 @@ They do not include the bucket value, credentials, or presigned URLs.
 |---|---|---|
 | `S3_EXPORT_BUCKET` | *(none)* | Bucket for these analysis exports |
 | `S3_BUCKET` | *(none)* | Fallback when `S3_EXPORT_BUCKET` is unset or blank |
-| `S3_PRESIGNED_URL_EXPIRES_SECONDS` | `3600` | Presigned GET lifetime in seconds. Unset or blank uses the default. Any other value must be a positive integer; otherwise the export fails. |
+| `S3_PRESIGNED_URL_EXPIRES_SECONDS` | `345600` | Presigned GET lifetime in seconds (4 days). Unset or blank uses the default. Any other value must be a positive integer; otherwise the export fails. AWS SigV4 allows at most 7 days when signing with IAM user access keys. Temporary STS/role credentials cannot mint a URL longer than the remaining session (often 12 hours or less); a 4-day URL is not guaranteed in that case. |
 | `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | as analysis | S3 client (`create_s3_client`) |
 
 `ContentType` values match the export worker:
@@ -94,13 +103,17 @@ This path does not write `local_data/exports`. A debug copy of the published
 JSON may still be saved under `local_data/analysis`; that file is not a
 download location for Java.
 
-The analysis pipeline has no human decisions, actions, or approved drafts.
-The snapshot passed to the existing renderers therefore uses tender fields
-and formatted requirements from the completion payload, sets `requirementId`
-from `sourceItemKey`, and leaves actions and draft sections empty. It does
-not invent `aiRecommendation` or `decision` (Excel shows "Not provided" and
-"No decision"). The Actions sheet is still created. Word states that no
-approved sections are available.
+The analysis pipeline has no human decisions or approved drafts. The snapshot
+passed to the existing renderers uses tender fields and formatted requirements
+from the completion payload and sets `requirementId` from `sourceItemKey`.
+Draft sections stay empty. Suggested `actions` are derived from evidence
+status (verify retrieved evidence, collect evidence for mandatory
+`NOT_FOUND`, or retry `NOT_CHECKED`). They are marked `AI_SUGGESTED`, are
+not published on the analysis JSON, and do not invent owners or due dates.
+Final Decision is never invented. `aiRecommendation` on that snapshot is a
+deterministic map from evidence-match status only (`NEEDS_HUMAN_REVIEW`,
+`EVIDENCE_REQUIRED`, or `NOT_CHECKED`) and is never a COMPLIANT /
+NON_COMPLIANT decision. Word states that no approved sections are available.
 
 If rendering, upload, or presigned URL generation fails, Python does **not**
 publish `RFP_ANALYSIS_COMPLETED`, does **not** include a partial
@@ -278,10 +291,10 @@ Python does **not** set any of the following; they are open questions only:
 | `requirements[].requirementId` | recommended | Java-owned (proposed) | Persistent ID. The analysis `sourceItemKey` (`REQ-001`) is positional and not stable across re-analysis. |
 | `requirements[].mandatory` | no | Java | `true`/`false`/`null`; `null` renders as "Not provided". |
 | `requirements[].sources[]`, `evidenceMatch` | no | Python analysis output, relayed by Java | Same shape as `RFP_ANALYSIS_COMPLETED`; `filename` is an optional addition. |
-| `requirements[].aiRecommendation` | no | Java-owned (proposed) | String or `{recommendation, rationale}`. No AI recommendation exists in this repo today; blank renders as "Not provided". Never derived. |
+| `requirements[].aiRecommendation` | no | Java-owned on `RFP_EXPORT_REQUESTED`; analysis Excel snapshot only | String or `{recommendation, rationale}`. Analysis completion Excel derives `{recommendation, rationale}` from evidence status after matching. Not added to published `RFP_ANALYSIS_COMPLETED` requirements. Blank Java snapshots still render as "Not provided". Never a Final Decision. |
 | `requirements[].decision` | no | Java-owned (proposed) | Human decision. Only the four decision values below count; anything else is no decision ("No decision"). |
-| `snapshot.actions[]` | no | Java-owned (proposed) | Rendered as-is. |
-| `snapshot.draftSections[]` | no | Java-owned (proposed) | Only `approvalStatus` == `APPROVED` (trimmed, case-insensitive) is exported. |
+| `snapshot.actions[]` | no | Java-owned on `RFP_EXPORT_REQUESTED`; analysis Excel/Word snapshot may add `AI_SUGGESTED` rows | Java actions rendered as-is. Analysis completion may append suggested actions from evidence status; those are not published on `RFP_ANALYSIS_COMPLETED`. |
+| `snapshot.draftSections[]` | no | Java-owned on `RFP_EXPORT_REQUESTED`; analysis Word snapshot may include Python `DRAFT` sections | Only `approvalStatus` == `APPROVED` is exported to Word. Analysis may generate six bid-response drafts (`status`/`approvalStatus` `DRAFT`) after evidence matching. They are not published on `RFP_ANALYSIS_COMPLETED`. Java must persist, edit, and approve. Python never self-approves. |
 
 **Proposed decision values** (Java to confirm): `COMPLIANT`,
 `PARTIALLY_COMPLIANT`, `NON_COMPLIANT`, `NOT_APPLICABLE`. This is a fixed
@@ -345,13 +358,26 @@ All cells are written as text (cell type string, never formulas or numbers).
   are cut to fit, never splitting a surrogate pair, and end with
   ` [truncated]`.
 
-**Word** (`tender-export-{exportId}.docx`) — tender title as heading,
-"Tender Information" (customer, reference, deadline when provided), then
-"Approved Draft Sections" with approved sections ordered by numeric `order`
-(sections without `order` follow, in input order). Content is plain text;
-blank lines separate paragraphs. With no approved sections the document says
-"No approved draft sections are available for this export." and contains no
-draft content.
+**Word** (`tender-export-{exportId}.docx`) — structured tender-response layout:
+cover (CBS banner, title, customer, reference, human-readable deadline), a
+static table of contents (ordinary table text, not a Word TOC field). Page
+numbers are copied from a LibreOffice PDF layout of the same file when
+`soffice` is available; otherwise the Page column is "—" rather than an
+estimate,
+executive summary, understanding of requirements, proposed technical
+approach, implementation methodology, company experience, a landscape
+requirement-by-requirement compliance response, assumptions, conclusion,
+then landscape appendices for extracted requirements and evidence
+references. Narrative chapters
+include Java `draftSections` only when `approvalStatus` is `APPROVED`
+(trimmed, case-insensitive) and the section title matches that chapter
+(exact or prefix). Unmatched approved titles appear under "Approved Draft
+Sections" only when such titles exist, ordered by numeric `order` then
+input order. Missing approved narrative is labelled "Information Required"
+once per chapter; if no approved drafts exist the document states that
+once. Python does not invent company experience or commitments. AI
+evidence status is never treated as a human decision. Content is plain
+text; blank lines separate paragraphs.
 
 ## S3
 
@@ -577,8 +603,8 @@ delayed-message exchange), which must be designed and confirmed by Java/ops.
     `exportId`; `exportId` character set (to avoid sanitisation collisions).
 12. Meaning of `attempt` (Java-owned counter; Python only echoes it).
 13. **PROPOSED, not approved:** `exportFiles` on `RFP_ANALYSIS_COMPLETED`
-    (`fileName` + expiring `downloadUrl` only; no local path, bucket, or
-    key). Java integration is not complete. See the section above.
+    (`fileName`, expiring `downloadUrl`, durable `bucket`/`key`, and
+    `expiresIn`). Java integration is not complete. See the section above.
 
 ## Running the worker
 

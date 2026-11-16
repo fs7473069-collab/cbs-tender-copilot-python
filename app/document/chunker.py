@@ -53,6 +53,8 @@ def _chunk_table(page, table, table_index):
 
     def emit(rows_to_emit):
         if rows_to_emit:
+            # Pack rows until MAX_CHUNK_CHARS. Do not emit one chunk per row:
+            # that inflates extract calls and changes checkpoint fingerprints.
             chunks.append({"page": page["page"], "text": "\n".join([header_line, *rows_to_emit]),
                            "source_type": "table", "table_index": table_index,
                            "page_reference_type": page.get("page_reference_type")})

@@ -9,16 +9,18 @@ from app.document.docx_processor import extract_docx_text
 from app.document.pdf_processor import extract_pdf_text
 from app.document.structure import describe_chunk_structure, locate_requirement
 from app.document.table_extractor import extract_pdf_tables
+from app.llm.ollama_client import chunk_extraction_decision
 from app.llm.ollama_client import extract_requirements
+from app.llm.ollama_client import normalize_chunk_text
 from app.rag.matcher import RequirementEvidenceMatcher
 from app.rag.retriever import INGEST_HINT
 
 
 PROGRESS_DIR = os.path.join("chunks", "requirements", "progress")
 OUTPUT_DIR = os.path.join("chunks", "requirements", "output")
-# 1 keeps the original strictly sequential extraction loop.
+# 1 is sequential: extract never overlaps relevance on the shared 8B model.
 EXTRACT_MAX_WORKERS_ENV = "TENDER_EXTRACT_MAX_WORKERS"
-EXTRACT_MAX_WORKERS_DEFAULT = 2
+EXTRACT_MAX_WORKERS_DEFAULT = 1
 
 
 def extract_max_workers():
@@ -88,6 +90,15 @@ def _all_requirements(progress):
 
 def _timed_extract(chunk):
     started = time.perf_counter()
+    text = chunk.get("text") if isinstance(chunk, dict) else ""
+    should_extract, skip_reason = chunk_extraction_decision(text)
+    if not should_extract:
+        print(
+            "Requirement extraction skipped "
+            f"reason={skip_reason} generate=0",
+            flush=True,
+        )
+        return {"requirements": []}, time.perf_counter() - started
     raw_result = extract_requirements(chunk)
     return raw_result, time.perf_counter() - started
 
@@ -198,10 +209,13 @@ def evidence_preflight(matcher, matcher_error=None):
     if status.get("available"):
         exclusions = getattr(retriever, "active_exclusions", None)
         excluded = exclusions() if callable(exclusions) else []
+        catalog_fn = getattr(retriever, "active_catalog_blocks", None)
+        catalog_blocked = catalog_fn() if callable(catalog_fn) else []
         print(
             "EVIDENCE_PREFLIGHT status=OK "
             f"chunks={status.get('chunks')} dimension={status.get('dimension')} "
-            f"excluded_sources={len(excluded)}",
+            f"excluded_sources={len(excluded)} "
+            f"catalog_blocked_sources={len(catalog_blocked)}",
             flush=True,
         )
     else:
@@ -458,10 +472,31 @@ def process_tender_document(file_path, resume=True):
         if stale:
             stale_matches.append((chunk_index, stale))
 
+    skippable = 0
+    extract_texts = []
+    for _chunk_index, chunk in pending:
+        text = chunk.get("text") if isinstance(chunk, dict) else ""
+        should_extract, _reason = chunk_extraction_decision(text)
+        if should_extract:
+            extract_texts.append(normalize_chunk_text(text))
+        else:
+            skippable += 1
+    unique_pending = len(set(extract_texts))
+    duplicate_pending = max(0, len(extract_texts) - unique_pending)
+    print(
+        "Extraction plan pending="
+        f"{len(pending)} skippable={skippable} unique_texts={unique_pending} "
+        f"duplicate_texts={duplicate_pending} checkpointed="
+        f"{len(chunks) - len(pending)}",
+        flush=True,
+    )
+
     max_workers = extract_max_workers()
     active_workers = 1
     executor = None
     futures = {}
+    # Default 1: sequential extract on this thread so it cannot compete with
+    # 8B relevance. A pool is created only when the operator sets workers > 1.
     if max_workers > 1 and len(pending) > 1:
         # Only LLM extraction runs in workers. Validation, evidence matching,
         # and checkpointing stay on this thread in original chunk order.

@@ -16,9 +16,21 @@ import app.export.local_export as local_export
 import app.messaging.consumer as consumer
 import app.messaging.export_consumer as export_consumer
 import app.storage.s3_client as s3_client
-from app.export.excel import NO_DECISION, NOT_PROVIDED
+from app.export.ai_recommendation import recommendation_from_evidence_match
+from app.export.excel import (
+    NO_DECISION,
+    PENDING_REVIEW,
+    _ai_recommendation,
+    render_excel,
+)
+from app.export.suggested_actions import (
+    SUGGESTED_STATUS,
+    merge_suggested_actions,
+)
 from app.export.local_export import (
     EXCEL_FILENAME,
+    EXPORT_FILE_ITEM_KEYS,
+    PRESIGNED_URL_EXPIRES_DEFAULT_SECONDS,
     WORD_FILENAME,
     LocalExportError,
     attach_export_files,
@@ -26,13 +38,26 @@ from app.export.local_export import (
     upload_analysis_exports,
 )
 from app.messaging.consumer import outbound_completion_payload
-from app.export.word import NO_APPROVED_SECTIONS_TEXT
+from app.export.snapshot import DRAFT_PENDING_REVIEW_LABEL
+from app.export.word import NO_APPROVED_SECTIONS_TEXT, PENDING_DRAFTS_HEADING
 from app.messaging.export_consumer import DOCX_CONTENT_TYPE, XLSX_CONTENT_TYPE
 from app.response.response_builder import build_completed_response
 
 
 def _download_url(key):
     return f"https://download.example.invalid/{key}"
+
+
+def _export_item(file_name, key, bucket="analysis-export-bucket", expires_in=None):
+    if expires_in is None:
+        expires_in = PRESIGNED_URL_EXPIRES_DEFAULT_SECONDS
+    return {
+        "fileName": file_name,
+        "downloadUrl": _download_url(key),
+        "bucket": bucket,
+        "key": key,
+        "expiresIn": expires_in,
+    }
 
 
 def _request(**overrides):
@@ -152,12 +177,32 @@ def test_snapshot_uses_analysis_fields_and_leaves_decisions_empty():
     assert requirement["confidence"] == 0.9
     assert requirement["evidenceMatch"]["status"] == "REVIEW_REQUIRED"
     assert requirement["sources"][0]["excerpt"] == "Synthetic excerpt."
-    assert "aiRecommendation" not in requirement
+    assert requirement["aiRecommendation"] == {
+        "recommendation": "NEEDS_HUMAN_REVIEW",
+        "rationale": (
+            "Retrieved evidence requires reviewer verification. "
+            "It does not prove compliance."
+        ),
+    }
     assert "decision" not in requirement
-    assert snapshot["actions"] == []
+    assert snapshot["actions"] == [{
+        "actionId": "AI-SUGGESTED-REQ-001",
+        "requirementId": "REQ-001",
+        "title": "AI suggested: Verify retrieved CBS evidence",
+        "description": (
+            "Verify the retrieved CBS evidence against this requirement. "
+            "Cited source: kb-synthetic.pdf, p.2. AI-suggested only; "
+            "not a completed task or human decision."
+        ),
+        "status": SUGGESTED_STATUS,
+    }]
+    assert "owner" not in snapshot["actions"][0]
+    assert "dueDate" not in snapshot["actions"][0]
     assert snapshot["draftSections"] == []
     assert "decision" not in response["result"]["requirements"][0]
     assert "aiRecommendation" not in response["result"]["requirements"][0]
+    assert "actions" not in response
+    assert "actions" not in response["result"]
 
 
 def test_both_reports_are_uploaded_with_presigned_urls(
@@ -176,16 +221,18 @@ def test_both_reports_are_uploaded_with_presigned_urls(
         DOCX_CONTENT_TYPE,
     ]
     assert {item["bucket"] for item in uploads} == {"analysis-export-bucket"}
+    assert PRESIGNED_URL_EXPIRES_DEFAULT_SECONDS == 345600
     assert [(item["bucket"], item["key"], item["expires_in"]) for item in presigns] == [
-        ("analysis-export-bucket", excel_key, 3600),
-        ("analysis-export-bucket", word_key, 3600),
+        ("analysis-export-bucket", excel_key, 345600),
+        ("analysis-export-bucket", word_key, 345600),
     ]
     assert files == [
-        {"fileName": EXCEL_FILENAME, "downloadUrl": _download_url(excel_key)},
-        {"fileName": WORD_FILENAME, "downloadUrl": _download_url(word_key)},
+        _export_item(EXCEL_FILENAME, excel_key),
+        _export_item(WORD_FILENAME, word_key),
     ]
     for item in files:
-        assert set(item) == {"fileName", "downloadUrl"}
+        assert tuple(item) == EXPORT_FILE_ITEM_KEYS
+        assert set(item) == set(EXPORT_FILE_ITEM_KEYS)
     assert list(tmp_path.rglob("*.xlsx")) == []
     assert list(tmp_path.rglob("*.docx")) == []
 
@@ -196,7 +243,13 @@ def test_both_reports_are_uploaded_with_presigned_urls(
         assert item["downloadUrl"] not in logged
 
     workbook = load_workbook(BytesIO(uploads[0]["data"]))
-    assert workbook.sheetnames == ["Requirements", "Compliance Matrix", "Actions"]
+    assert workbook.sheetnames == [
+        "Tender Overview",
+        "Requirements",
+        "Compliance Matrix",
+        "Actions",
+        "AI Draft Responses",
+    ]
     requirements = _rows(workbook["Requirements"])
     assert requirements[1][0] == "REQ-001"
     assert "Synthetic requirement for export." in requirements[1]
@@ -205,20 +258,250 @@ def test_both_reports_are_uploaded_with_presigned_urls(
         _rows(workbook["Compliance Matrix"])[0],
         _rows(workbook["Compliance Matrix"])[1],
     ))
-    assert compliance["Final Decision"] == NO_DECISION
-    assert compliance["AI Recommendation"] == NOT_PROVIDED
+    assert compliance["Final Decision"] == PENDING_REVIEW == NO_DECISION
+    assert compliance["AI Recommendation"] == (
+        "NEEDS_HUMAN_REVIEW: Retrieved evidence requires reviewer "
+        "verification. It does not prove compliance."
+    )
     assert compliance["AI Evidence Status"] == "REVIEW_REQUIRED"
-    assert _rows(workbook["Actions"]) == [_rows(workbook["Actions"])[0]]
-    assert len(_rows(workbook["Actions"])) == 1
+    assert _rows(workbook["Actions"])[0][2] == "Title"
+    actions_row = dict(zip(
+        _rows(workbook["Actions"])[0],
+        _rows(workbook["Actions"])[1],
+    ))
+    assert actions_row["Action ID"] == "AI-SUGGESTED-REQ-001"
+    assert actions_row["Requirement ID"] == "REQ-001"
+    assert actions_row["Title"].startswith("AI suggested:")
+    assert "kb-synthetic.pdf" in actions_row["Description"]
+    assert "p.2" in actions_row["Description"]
+    assert actions_row["Status"] == SUGGESTED_STATUS
+    assert actions_row["Owner"] in (None, "")
+    assert actions_row["Due Date"] in (None, "")
+    assert len(_rows(workbook["Actions"])) == 2
 
-    text = "\n".join(
-        paragraph.text for paragraph in Document(BytesIO(uploads[1]["data"])).paragraphs
+    document = Document(BytesIO(uploads[1]["data"]))
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    table_text = "\n".join(
+        cell.text
+        for table in document.tables
+        for row in table.rows
+        for cell in row.cells
     )
     assert "Synthetic Tender" in text
-    assert "Synthetic Customer" in text
+    assert "Synthetic Customer" in table_text
     assert NO_APPROVED_SECTIONS_TEXT in text
     assert "Invented draft" not in text
     assert "exportFiles" not in response
+    draft_sheet = _rows(workbook["AI Draft Responses"])
+    assert draft_sheet[0][3] == "Review Status"
+    assert DRAFT_PENDING_REVIEW_LABEL in draft_sheet[1]
+
+
+def test_analysis_export_uses_response_draft_sections(
+    tmp_path, monkeypatch, mock_analysis_export_s3,
+):
+    monkeypatch.chdir(tmp_path)
+    response = _completed()
+    response["draftSections"] = [{
+        "sectionId": "DRAFT-TECHNICAL_APPROACH",
+        "sectionType": "TECHNICAL_APPROACH",
+        "title": "Proposed Technical Approach",
+        "content": "Pending technical draft for any tender.",
+        "status": "DRAFT",
+        "approvalStatus": "DRAFT",
+        "sourceRequirementIds": ["REQ-001"],
+        "sources": [{"filename": "tender.docx", "page": 2}],
+        "missingInformation": ["Support coverage is not evidenced."],
+        "order": 3,
+        "approvedBy": None,
+    }]
+    snapshot = snapshot_from_completed_response(response)
+    assert snapshot["draftSections"][0]["sectionId"] == "DRAFT-TECHNICAL_APPROACH"
+    assert snapshot["draftSections"][0]["approvalStatus"] == "DRAFT"
+
+    files = upload_analysis_exports(response)
+    uploads = mock_analysis_export_s3["uploads"]
+    assert [item["key"] for item in uploads] == list(_keys())
+    workbook = load_workbook(BytesIO(uploads[0]["data"]))
+    headers = _rows(workbook["AI Draft Responses"])[0]
+    row = dict(zip(headers, _rows(workbook["AI Draft Responses"])[1]))
+    assert row["Section Type"] == "TECHNICAL_APPROACH"
+    assert row["Generated Content"] == "Pending technical draft for any tender."
+    assert row["Review Status"] == DRAFT_PENDING_REVIEW_LABEL
+    assert row["Related Requirement IDs"] == "REQ-001"
+    assert "tender.docx" in row["Source References"]
+    assert "Support coverage is not evidenced." in row["Missing Information"]
+    document = Document(BytesIO(uploads[1]["data"]))
+    text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    pending_at = text.index(PENDING_DRAFTS_HEADING)
+    assert "Pending technical draft for any tender." not in text[:pending_at]
+    assert "Pending technical draft for any tender." in text[pending_at:]
+    assert files[0]["fileName"] == EXCEL_FILENAME
+    assert files[1]["fileName"] == WORD_FILENAME
+
+
+def _snapshot_with_evidence(status, **match_extra):
+    response = _completed()
+    match = {"status": status, "note": "n", "evidence": []}
+    match.update(match_extra)
+    response["result"]["requirements"][0]["evidenceMatch"] = match
+    return snapshot_from_completed_response(response)
+
+
+def test_review_required_maps_to_needs_human_review():
+    snapshot = _snapshot_with_evidence("REVIEW_REQUIRED")
+    rec = snapshot["requirements"][0]["aiRecommendation"]
+    assert rec["recommendation"] == "NEEDS_HUMAN_REVIEW"
+    assert "reviewer verification" in rec["rationale"]
+    assert "decision" not in snapshot["requirements"][0]
+
+
+def test_not_found_maps_to_evidence_required():
+    rec = _snapshot_with_evidence("NOT_FOUND")["requirements"][0]["aiRecommendation"]
+    assert rec == recommendation_from_evidence_match({"status": "NOT_FOUND"})
+    assert rec["recommendation"] == "EVIDENCE_REQUIRED"
+    assert "No acceptable CBS evidence" in rec["rationale"]
+
+
+def test_not_checked_maps_to_not_checked():
+    rec = _snapshot_with_evidence("NOT_CHECKED")["requirements"][0]["aiRecommendation"]
+    assert rec["recommendation"] == "NOT_CHECKED"
+    assert "could not be completed" in rec["rationale"]
+
+
+def test_missing_and_unknown_evidence_status_are_not_invented():
+    response = _completed()
+    response["result"]["requirements"][0].pop("evidenceMatch")
+    snapshot = snapshot_from_completed_response(response)
+    assert "aiRecommendation" not in snapshot["requirements"][0]
+
+    unknown = _snapshot_with_evidence("COMPLIANT")
+    assert "aiRecommendation" not in unknown["requirements"][0]
+    assert snapshot["actions"] == []
+    assert unknown["actions"] == []
+    assert recommendation_from_evidence_match({"status": "COMPLIANT"}) is None
+    assert recommendation_from_evidence_match(None) is None
+    assert recommendation_from_evidence_match({"status": ""}) is None
+    assert recommendation_from_evidence_match({"status": "  "}) is None
+
+
+def test_excel_recommendation_column_and_final_decision_stay_separate():
+    for status, expected_code in (
+        ("REVIEW_REQUIRED", "NEEDS_HUMAN_REVIEW"),
+        ("NOT_FOUND", "EVIDENCE_REQUIRED"),
+        ("NOT_CHECKED", "NOT_CHECKED"),
+    ):
+        snapshot = _snapshot_with_evidence(status)
+        requirement = snapshot["requirements"][0]
+        displayed = _ai_recommendation(requirement["aiRecommendation"])
+        assert displayed.startswith(expected_code + ":")
+        workbook = load_workbook(BytesIO(render_excel(snapshot)))
+        row = dict(zip(
+            [cell.value for cell in workbook["Compliance Matrix"][1]],
+            [cell.value for cell in workbook["Compliance Matrix"][2]],
+        ))
+        assert row["AI Recommendation"] == displayed
+        assert row["Final Decision"] == PENDING_REVIEW == NO_DECISION
+        assert row["AI Evidence Status"] == status
+        assert row["Decided By"] in (None, "")
+        assert "COMPLIANT" not in displayed
+        assert "NON_COMPLIANT" not in displayed
+
+
+def test_review_required_action_includes_source_and_page():
+    snapshot = _snapshot_with_evidence(
+        "REVIEW_REQUIRED",
+        evidence=[{
+            "text": "passage",
+            "source": "Karandaaz.pdf",
+            "page": 4,
+            "similarity": 0.7,
+        }],
+    )
+    action = snapshot["actions"][0]
+    assert action["actionId"] == "AI-SUGGESTED-REQ-001"
+    assert action["requirementId"] == "REQ-001"
+    assert action["title"].startswith("AI suggested:")
+    assert "Karandaaz.pdf" in action["description"]
+    assert "p.4" in action["description"]
+    assert action["status"] == SUGGESTED_STATUS
+    assert "owner" not in action
+    assert "dueDate" not in action
+
+
+def test_mandatory_not_found_creates_collect_action():
+    snapshot = _snapshot_with_evidence("NOT_FOUND")
+    assert snapshot["requirements"][0]["mandatory"] is True
+    action = snapshot["actions"][0]
+    assert action["title"] == "AI suggested: Identify CBS evidence"
+    assert "mandatory" in action["description"].lower()
+    assert "missing evidence" not in action["title"].lower()
+
+
+def test_optional_not_found_does_not_create_action():
+    response = _completed()
+    response["result"]["requirements"][0]["mandatory"] = False
+    response["result"]["requirements"][0]["evidenceMatch"] = {
+        "status": "NOT_FOUND", "evidence": [],
+    }
+    snapshot = snapshot_from_completed_response(response)
+    assert snapshot["actions"] == []
+
+
+def test_not_checked_action_is_retry_not_missing_evidence():
+    action = _snapshot_with_evidence("NOT_CHECKED")["actions"][0]
+    assert action["title"] == "AI suggested: Investigate evidence matching"
+    lowered = action["description"].lower()
+    assert "does not mean evidence is missing" in lowered
+    assert "collect" not in lowered
+
+
+def test_duplicate_requirement_gets_one_suggested_action():
+    requirement = {
+        "requirementId": "REQ-001",
+        "mandatory": True,
+        "evidenceMatch": {
+            "status": "REVIEW_REQUIRED",
+            "evidence": [{"source": "a.pdf", "page": 1}],
+        },
+    }
+    actions = merge_suggested_actions([requirement, dict(requirement)])
+    assert len(actions) == 1
+    assert actions[0]["actionId"] == "AI-SUGGESTED-REQ-001"
+
+
+def test_existing_java_actions_are_preserved_and_not_duplicated():
+    response = _completed()
+    existing = {
+        "actionId": "act-java-1",
+        "requirementId": "REQ-001",
+        "title": "Human follow-up",
+        "description": "Already assigned",
+        "owner": "reviewer-1",
+        "dueDate": "2099-02-01",
+        "status": "OPEN",
+    }
+    response["actions"] = [existing]
+    snapshot = snapshot_from_completed_response(response)
+    assert snapshot["actions"] == [existing]
+    assert snapshot["actions"][0]["owner"] == "reviewer-1"
+
+
+def test_excel_actions_sheet_shows_suggested_status_clearly():
+    snapshot = _snapshot_with_evidence("NOT_CHECKED")
+    workbook = load_workbook(BytesIO(render_excel(snapshot)))
+    row = dict(zip(
+        [cell.value for cell in workbook["Actions"][1]],
+        [cell.value for cell in workbook["Actions"][2]],
+    ))
+    assert row["Status"] == SUGGESTED_STATUS
+    assert row["Title"].startswith("AI suggested:")
+    assert row["Requirement ID"] == "REQ-001"
+    overview = "\n".join(
+        str(cell.value or "") for row_cells in workbook["Tender Overview"].iter_rows()
+        for cell in row_cells
+    )
+    assert "No actions are available" not in overview
 
 
 def test_export_bucket_wins_over_fallback(monkeypatch, capsys, mock_analysis_export_s3):
@@ -270,11 +553,12 @@ def test_missing_bucket_fails_before_upload(monkeypatch, mock_analysis_export_s3
 def test_custom_presign_expiry(monkeypatch, mock_analysis_export_s3):
     monkeypatch.setenv("S3_PRESIGNED_URL_EXPIRES_SECONDS", " 120 ")
 
-    upload_analysis_exports(_completed())
+    files = upload_analysis_exports(_completed())
 
     assert [item["expires_in"] for item in mock_analysis_export_s3["presigns"]] == [
         120, 120,
     ]
+    assert [item["expiresIn"] for item in files] == [120, 120]
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "abc", "3600.5", "1e3", "+60", "True"])
@@ -322,10 +606,12 @@ def test_export_does_not_call_ollama_rag_or_export_worker(
 
     def count_excel(snapshot):
         excel_calls["n"] += 1
-        assert snapshot["actions"] == []
+        assert snapshot["actions"][0]["status"] == SUGGESTED_STATUS
         assert snapshot["draftSections"] == []
         assert "decision" not in snapshot["requirements"][0]
-        assert "aiRecommendation" not in snapshot["requirements"][0]
+        assert snapshot["requirements"][0]["aiRecommendation"]["recommendation"] == (
+            "NEEDS_HUMAN_REVIEW"
+        )
         return real_excel(snapshot)
 
     def count_word(snapshot):
@@ -468,14 +754,8 @@ def test_outbound_payload_drops_only_requirements():
     response = attach_export_files(
         _completed(),
         [
-            {
-                "fileName": EXCEL_FILENAME,
-                "downloadUrl": "https://download.example.invalid/tender-export.xlsx",
-            },
-            {
-                "fileName": WORD_FILENAME,
-                "downloadUrl": "https://download.example.invalid/tender-export.docx",
-            },
+            _export_item(EXCEL_FILENAME, "exports/a/tender-export.xlsx"),
+            _export_item(WORD_FILENAME, "exports/a/tender-export.docx"),
         ],
     )
     outbound = outbound_completion_payload(response)
@@ -557,8 +837,8 @@ def test_completion_publishes_download_urls_and_keeps_analysis_fields(
     message = seen[0]
     excel_key, word_key = _keys()
     assert message["exportFiles"] == [
-        {"fileName": EXCEL_FILENAME, "downloadUrl": _download_url(excel_key)},
-        {"fileName": WORD_FILENAME, "downloadUrl": _download_url(word_key)},
+        _export_item(EXCEL_FILENAME, excel_key),
+        _export_item(WORD_FILENAME, word_key),
     ]
     assert [item["key"] for item in mock_analysis_export_s3["uploads"]] == [
         excel_key, word_key,
@@ -647,7 +927,9 @@ def test_published_json_omits_requirements_and_keeps_internal_copy(
         WORD_FILENAME,
     ]
     for item in published["exportFiles"]:
-        assert set(item) == {"fileName", "downloadUrl"}
+        assert set(item) == set(EXPORT_FILE_ITEM_KEYS)
+        assert item["expiresIn"] == 345600
+        assert item["bucket"] == "analysis-export-bucket"
     assert len(mock_analysis_export_s3["uploads"]) == 2
     saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
     assert len(saved["result"]["requirements"]) == 328
@@ -808,13 +1090,13 @@ def test_republish_after_failed_publish_reuploads_the_same_keys(
     second_keys = [item["key"] for item in mock_analysis_export_s3["uploads"]]
     assert second_keys == first_keys + first_keys
     assert seen == [[
-        {"fileName": EXCEL_FILENAME, "downloadUrl": _download_url(first_keys[0])},
-        {"fileName": WORD_FILENAME, "downloadUrl": _download_url(first_keys[1])},
+        _export_item(EXCEL_FILENAME, first_keys[0]),
+        _export_item(WORD_FILENAME, first_keys[1]),
     ]]
     saved = json.loads(consumer.DEBUG_RESPONSE_PATH.read_text(encoding="utf-8"))
     assert saved["exportFiles"] == seen[0]
     for item in saved["exportFiles"]:
-        assert set(item) == {"fileName", "downloadUrl"}
+        assert set(item) == set(EXPORT_FILE_ITEM_KEYS)
 
 
 def test_export_worker_entrypoint_remains_importable():

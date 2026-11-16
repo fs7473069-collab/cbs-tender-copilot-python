@@ -6,6 +6,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Analysis request queue. Prefer RABBITMQ_REQUEST_QUEUE; fall back to the
+# legacy RABBITMQ_QUEUE name used by existing deployments.
+ANALYSIS_REQUEST_QUEUE_ENV = "RABBITMQ_REQUEST_QUEUE"
+ANALYSIS_REQUEST_QUEUE_LEGACY_ENV = "RABBITMQ_QUEUE"
+ANALYSIS_REQUEST_QUEUE_DEFAULT = "rfp-python-test"
+
+
+def configured_analysis_request_queue():
+    """Queue the analysis consumer listens on. Never used as a response destination."""
+    for name in (ANALYSIS_REQUEST_QUEUE_ENV, ANALYSIS_REQUEST_QUEUE_LEGACY_ENV):
+        raw = os.getenv(name)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return ANALYSIS_REQUEST_QUEUE_DEFAULT
+
 
 def create_connection():
     username = os.getenv("RABBITMQ_USERNAME")

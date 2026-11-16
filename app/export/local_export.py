@@ -13,7 +13,9 @@ same keys. Nothing is returned unless both uploads and both URLs succeed.
 import os
 import re
 
+from app.export.ai_recommendation import recommendation_from_evidence_match
 from app.export.excel import render_excel
+from app.export.suggested_actions import merge_suggested_actions
 from app.export.word import render_word
 from app.messaging.export_consumer import (
     DOCX_CONTENT_TYPE,
@@ -30,7 +32,18 @@ EXCEL_FILENAME = "tender-export.xlsx"
 WORD_FILENAME = "tender-export.docx"
 KEY_PREFIX = "exports"
 PRESIGNED_URL_EXPIRES_ENV = "S3_PRESIGNED_URL_EXPIRES_SECONDS"
-PRESIGNED_URL_EXPIRES_DEFAULT_SECONDS = 3600
+# 4 days. AWS SigV4 allows at most 7 days (604800) when signing with IAM
+# user access keys (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY). Temporary
+# STS or role credentials cannot outlive the session; those URLs often
+# fail after 12 hours or less even if this value is 345600.
+PRESIGNED_URL_EXPIRES_DEFAULT_SECONDS = 345600
+EXPORT_FILE_ITEM_KEYS = (
+    "fileName",
+    "downloadUrl",
+    "bucket",
+    "key",
+    "expiresIn",
+)
 _PATH_FIELDS = ("organizationId", "workspaceId", "jobId", "analysisId")
 _TENDER_FIELDS = (
     "title",
@@ -110,11 +123,29 @@ def _require_bucket():
     return bucket.strip(), source
 
 
+def _existing_snapshot_drafts(response, result):
+    for container in (response, result):
+        value = container.get("draftSections") if isinstance(container, dict) else None
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
+def _existing_snapshot_actions(response, result):
+    """Java/human actions if already present. Analysis JSON normally has none."""
+    for container in (response, result):
+        value = container.get("actions") if isinstance(container, dict) else None
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)]
+    return []
+
+
 def snapshot_from_completed_response(response):
     """Map an in-memory analysis result to the renderer snapshot.
 
-    There are no human decisions, actions, or approved drafts. Those snapshot
-    fields are omitted or empty so the renderer shows its own placeholders.
+    Human decisions and approved drafts stay empty. Suggested actions are
+    derived from evidence status only and are not published on the analysis
+    JSON.
     """
     if not isinstance(response, dict):
         raise LocalExportError("Analysis response must be an object")
@@ -125,28 +156,59 @@ def snapshot_from_completed_response(response):
     if not isinstance(raw_requirements, list):
         raise LocalExportError("Analysis requirements must be a list")
 
+    filenames_by_id = {}
+    for document in response.get("documents") or []:
+        if not isinstance(document, dict):
+            continue
+        document_id = document.get("documentId")
+        filename = document.get("filename")
+        if isinstance(document_id, str) and document_id.strip() and isinstance(filename, str):
+            filenames_by_id[document_id.strip()] = filename
+
     requirements = []
     for item in raw_requirements:
         if not isinstance(item, dict):
             raise LocalExportError("Analysis requirement must be an object")
+        sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+        copied_sources = []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            copied = dict(source)
+            document_id = copied.get("documentId")
+            if (
+                not copied.get("filename")
+                and isinstance(document_id, str)
+                and document_id.strip() in filenames_by_id
+            ):
+                copied["filename"] = filenames_by_id[document_id.strip()]
+            copied_sources.append(copied)
         requirement = {
             "requirementId": item.get("sourceItemKey"),
             "sourceItemKey": item.get("sourceItemKey"),
             "content": item.get("content"),
             "mandatory": item.get("mandatory"),
+            "category": item.get("category"),
             "confidence": item.get("confidence"),
-            "sources": item.get("sources") if isinstance(item.get("sources"), list) else [],
+            "sources": copied_sources,
         }
         evidence_match = item.get("evidenceMatch")
         if isinstance(evidence_match, dict):
             requirement["evidenceMatch"] = evidence_match
+            derived = recommendation_from_evidence_match(evidence_match)
+            if derived is not None:
+                # Snapshot-only. Never written onto the published analysis JSON.
+                requirement["aiRecommendation"] = derived
         requirements.append(requirement)
 
     return {
         "tender": {field: result.get(field) for field in _TENDER_FIELDS},
         "requirements": requirements,
-        "actions": [],
-        "draftSections": [],
+        "actions": merge_suggested_actions(
+            requirements,
+            _existing_snapshot_actions(response, result),
+        ),
+        "draftSections": _existing_snapshot_drafts(response, result),
     }
 
 
@@ -160,11 +222,17 @@ def _upload_and_presign(data, bucket, key, file_name, content_type, expires_in):
     url = create_presigned_download_url(bucket, key, expires_in)
     if not isinstance(url, str) or not url.strip():
         raise LocalExportError("Presigned download URL was empty")
-    return {"fileName": file_name, "downloadUrl": url}
+    return {
+        "fileName": file_name,
+        "downloadUrl": url,
+        "bucket": bucket,
+        "key": key,
+        "expiresIn": expires_in,
+    }
 
 
 def upload_analysis_exports(response):
-    """Upload Excel then Word and return fileName/downloadUrl entries only.
+    """Upload Excel then Word and return durable refs plus a presigned GET.
 
     Both uploads and both presigned URLs must succeed. A later failure raises
     and does not return a partial list. An object uploaded before that failure
@@ -197,11 +265,17 @@ def upload_analysis_exports(response):
     return [excel, word]
 
 
+def _export_file_text(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise LocalExportError(f"Export {field} is invalid")
+    return value
+
+
 def attach_export_files(response, export_files):
     """Return a copy of the analysis response plus top-level exportFiles.
 
-    Existing keys are kept. Each file entry is only fileName and downloadUrl.
-    path, bucket, and key are not copied onto the response.
+    Existing analysis keys are kept. Each file entry is fileName, downloadUrl,
+    bucket, key, and expiresIn. path and other extra fields are not copied.
     """
     if not isinstance(response, dict):
         raise LocalExportError("Analysis response must be an object")
@@ -215,9 +289,20 @@ def attach_export_files(response, export_files):
         download_url = item.get("downloadUrl")
         if file_name not in (EXCEL_FILENAME, WORD_FILENAME):
             raise LocalExportError("Export file name is invalid")
-        if not isinstance(download_url, str) or not download_url.strip():
-            raise LocalExportError("Export download URL is invalid")
-        cleaned.append({"fileName": file_name, "downloadUrl": download_url})
+        expires_in = item.get("expiresIn")
+        if (
+            isinstance(expires_in, bool)
+            or not isinstance(expires_in, int)
+            or expires_in <= 0
+        ):
+            raise LocalExportError("Export expiresIn is invalid")
+        cleaned.append({
+            "fileName": file_name,
+            "downloadUrl": _export_file_text(download_url, "download URL"),
+            "bucket": _export_file_text(item.get("bucket"), "bucket"),
+            "key": _export_file_text(item.get("key"), "key"),
+            "expiresIn": expires_in,
+        })
     if [item["fileName"] for item in cleaned] != [EXCEL_FILENAME, WORD_FILENAME]:
         raise LocalExportError("Export files are incomplete")
     updated = dict(response)

@@ -133,10 +133,11 @@ RABBITMQ_VHOST=/
 RABBITMQ_USERNAME=
 RABBITMQ_PASSWORD=
 
+RABBITMQ_REQUEST_QUEUE=copilot-analysis1
 RABBITMQ_QUEUE=copilot-analysis
 ```
 
-The request queue is configurable through `RABBITMQ_QUEUE`. The application currently uses `copilot-analysis` in its configured integration environment. The consumer's code-level fallback is `rfp-python-test` when the environment variable is not set.
+The analysis request queue is `RABBITMQ_REQUEST_QUEUE` when set, otherwise the legacy `RABBITMQ_QUEUE`. Shared integration commonly uses `copilot-analysis`. Mac development should set `RABBITMQ_REQUEST_QUEUE=copilot-analysis1` so local consumers do not take shared integration messages. The code-level fallback is `rfp-python-test` when neither variable is set. Analysis responses are never published to the request queue.
 
 The response queue is currently hard-coded in `app/messaging/publisher.py` as:
 
@@ -194,28 +195,6 @@ Current messaging behaviour:
 - A status companion event may be built locally but is not published.
 - Failed analysis does not currently publish a dedicated FAILED event.
 - Long-running extraction can be slow on CPU/RAM-constrained deployment VMs.
-- Messages whose `eventType` starts with `RFP_EXPORT_` are rejected without requeue and never analysed.
-
-### Export worker (PROPOSED contract)
-
-A separate worker renders Excel + Word from a Java-supplied snapshot, uploads both to S3 and publishes `RFP_EXPORT_COMPLETED` / `RFP_EXPORT_FAILED`. It uses `RABBITMQ_EXPORT_REQUEST_QUEUE` (default `rfp-export-requests`), `RABBITMQ_EXPORT_RESPONSE_QUEUE` (default `rfp-export-responses`) and the bucket from the request's `output.bucket`, else `S3_EXPORT_BUCKET`, else `S3_BUCKET`. See [docs/export_contract.md](docs/export_contract.md); the contract is not yet agreed with Java and Java integration is not complete.
-
-```powershell
-python -m app.messaging.export_consumer
-```
-
-Optional Docker Compose service (not started by a plain `docker compose up`; the analysis service is unchanged):
-
-```bash
-docker compose --profile export up -d export-worker
-```
-
-Operational notes:
-
-- The worker refuses to start (exit code 2, before connecting) if an export queue name is blank, the two export queues are equal, or either equals the analysis request queue (`RABBITMQ_QUEUE`, default `rfp-python-test`) or `rfp_docs_response1`.
-- Both export queues are declared `durable=True` with no other arguments; dead-letter, quorum and TTL settings are not set by Python and must be agreed with Java/ops.
-- Idempotency ledger: `local_data/messaging/completed_exports.json`. If it is unreadable it is never overwritten: the worker keeps the original, writes a `.corrupt-<timestamp>` copy, requeues the in-flight request and exits with code 3. Repair or move the file aside, then restart. Run a single export worker (the ledger is not shared between replicas).
-- Retryable failures are requeued once after `EXPORT_REQUEUE_DELAY_SECONDS` (default 5).
 
 ### Tests
 
@@ -309,7 +288,7 @@ rfp_docs_response1  (hard-coded in publisher.py)
 Java backend
 ```
 
-Request queue: configurable via `RABBITMQ_QUEUE` (integration env commonly `copilot-analysis`; code fallback `rfp-python-test`).
+Request queue: `RABBITMQ_REQUEST_QUEUE` (preferred) or `RABBITMQ_QUEUE` (legacy). Mac development: `copilot-analysis1`. Integration commonly `copilot-analysis`. Code fallback `rfp-python-test`.
 
 Response queue: hard-coded `rfp_docs_response1` in `app/messaging/publisher.py`. Confirmed by Zeeshan as the queue consumed by the Java backend.
 

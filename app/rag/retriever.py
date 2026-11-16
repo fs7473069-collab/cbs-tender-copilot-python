@@ -17,15 +17,116 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 KB_DIR = PROJECT_ROOT / "local_data" / "cbs_knowledge_base"
 INDEX_PATH = KB_DIR / "cbs.index"
 METADATA_PATH = KB_DIR / "chunks.json"
+CATALOG_FILENAME = "source_catalog.json"
 INGEST_HINT = "Build it with: python -m app.rag.ingest"
 # Opt-in: "|"-separated exact KB source names hidden from retrieval without
 # changing the index. Unset or empty keeps every indexed source searchable.
 KB_EXCLUDE_SOURCES_ENV = "CBS_KB_EXCLUDE_SOURCES"
+DOC_KINDS = frozenset({
+    "buyer_tender",
+    "cbs_proposal",
+    "requirements_spec",
+    "architecture",
+    "other",
+})
+
+
+def catalog_path():
+    """Catalog lives beside the index; follows a monkeypatched ``KB_DIR``."""
+    return KB_DIR / CATALOG_FILENAME
 
 
 def excluded_sources_from_env():
     raw = os.getenv(KB_EXCLUDE_SOURCES_ENV) or ""
     return frozenset(name.strip() for name in raw.split("|") if name.strip())
+
+
+def _entry_blocks_evidence(entry):
+    """True when a parsed catalog row must not be used as CBS evidence."""
+    if entry.get("doc_kind") == "buyer_tender":
+        return True
+    return entry.get("allow_as_cbs_evidence") is False
+
+
+def load_source_catalog(path=None):
+    """Load filename → {doc_kind, allow_as_cbs_evidence}.
+
+    Missing or invalid files yield an empty catalog (fail-open) and a warning.
+    Unknown or invalid entries are skipped so those sources stay searchable.
+    """
+    catalog_file = Path(path) if path is not None else catalog_path()
+    if not catalog_file.is_file():
+        print(
+            "KB_CATALOG missing "
+            f"path={catalog_file} fail_open=1; all indexed sources searchable "
+            "except CBS_KB_EXCLUDE_SOURCES",
+            flush=True,
+        )
+        return {}
+
+    try:
+        raw = json.loads(catalog_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(
+            "KB_CATALOG unreadable "
+            f"path={catalog_file} error_type={type(exc).__name__} fail_open=1",
+            flush=True,
+        )
+        return {}
+
+    if not isinstance(raw, dict):
+        print(
+            "KB_CATALOG invalid "
+            f"path={catalog_file} reason=not_an_object fail_open=1",
+            flush=True,
+        )
+        return {}
+
+    catalog = {}
+    skipped = 0
+    for source, entry in raw.items():
+        if not isinstance(source, str) or not source.strip():
+            skipped += 1
+            continue
+        if not isinstance(entry, dict):
+            skipped += 1
+            print(
+                "KB_CATALOG skip_entry "
+                f"source={source.strip()!r} reason=entry_not_object",
+                flush=True,
+            )
+            continue
+        doc_kind = entry.get("doc_kind")
+        allow = entry.get("allow_as_cbs_evidence")
+        if doc_kind not in DOC_KINDS:
+            skipped += 1
+            print(
+                "KB_CATALOG skip_entry "
+                f"source={source.strip()!r} reason=invalid_doc_kind",
+                flush=True,
+            )
+            continue
+        if allow is not None and not isinstance(allow, bool):
+            skipped += 1
+            print(
+                "KB_CATALOG skip_entry "
+                f"source={source.strip()!r} reason=invalid_allow_flag",
+                flush=True,
+            )
+            continue
+        catalog[source.strip()] = {
+            "doc_kind": doc_kind,
+            "allow_as_cbs_evidence": allow,
+        }
+
+    blocked = sum(1 for entry in catalog.values() if _entry_blocks_evidence(entry))
+    print(
+        "KB_CATALOG loaded "
+        f"path={catalog_file} entries={len(catalog)} "
+        f"blocked={blocked} skipped={skipped}",
+        flush=True,
+    )
+    return catalog
 
 
 class RetrievalError(RuntimeError):
@@ -105,7 +206,7 @@ def _embed_queries(texts):
 
 
 class TenderRetriever:
-    def __init__(self, persist=True, excluded_sources=None):
+    def __init__(self, persist=True, excluded_sources=None, source_catalog=None):
         self.index = None
         self.chunks = []
         self.persist = persist
@@ -113,6 +214,10 @@ class TenderRetriever:
         self.excluded_sources = (
             excluded_sources_from_env()
             if excluded_sources is None else frozenset(excluded_sources)
+        )
+        self.source_catalog = (
+            load_source_catalog()
+            if source_catalog is None else dict(source_catalog)
         )
         # Cache exact query strings within one process to avoid repeat embeds.
         self._query_embedding_cache = {}
@@ -263,6 +368,24 @@ class TenderRetriever:
         present = {chunk.get("source") for chunk in self.chunks}
         return sorted(self.excluded_sources & present)
 
+    def _catalog_blocks_source(self, source):
+        entry = self.source_catalog.get(source)
+        if not isinstance(entry, dict):
+            return False
+        return _entry_blocks_evidence(entry)
+
+    def _source_hidden_from_search(self, source):
+        if source in self.excluded_sources:
+            return True
+        return self._catalog_blocks_source(source)
+
+    def active_catalog_blocks(self):
+        """Catalog-blocked source names that are present in the index."""
+        present = {chunk.get("source") for chunk in self.chunks}
+        return sorted(
+            source for source in present if self._catalog_blocks_source(source)
+        )
+
     def _search(self, query_embedding, top_k):
         if query_embedding.shape[-1] != self.index.d:
             raise RetrievalError(
@@ -270,12 +393,13 @@ class TenderRetriever:
                 f"Query embedding dimension {query_embedding.shape[-1]} does "
                 f"not match index dimension {self.index.d}. {INGEST_HINT}",
             )
-        excluded = self.excluded_sources
-        hidden = (
-            sum(1 for chunk in self.chunks if chunk.get("source") in excluded)
-            if excluded else 0
+        hidden = sum(
+            1
+            for chunk in self.chunks
+            if self._source_hidden_from_search(chunk.get("source"))
         )
-        # Over-fetch by the hidden count so exclusions never shrink top_k.
+        # Over-fetch by the hidden count so env/catalog filters never shrink
+        # top_k when enough allowed neighbours exist.
         k = min(top_k + hidden, len(self.chunks))
         scores, indices = self.index.search(query_embedding, k)
         results = []
@@ -283,7 +407,7 @@ class TenderRetriever:
             if idx < 0:
                 continue
             chunk = self.chunks[int(idx)]
-            if excluded and chunk.get("source") in excluded:
+            if self._source_hidden_from_search(chunk.get("source")):
                 continue
             results.append({
                 "text": chunk["text"],

@@ -13,7 +13,9 @@ from app.llm.ollama_client import assess_evidence_relevance_batch
 from app.rag.retriever import KB_DIR, RetrievalError, TenderRetriever
 
 
-RELEVANCE_CONFIG_VERSION = "lexical-prefilter-v2|relevance-prompt-v1"
+RELEVANCE_CONFIG_VERSION = (
+    "lexical-prefilter-v2|relevance-prompt-v1|ws-norm-v1"
+)
 DEFAULT_CACHE_PATH = KB_DIR / "relevance_cache.json"
 _STOP_WORDS = frozenset({
     "about", "against", "also", "and", "are", "been", "being", "by", "can",
@@ -233,8 +235,8 @@ class RequirementEvidenceMatcher:
     @staticmethod
     def _cache_key(requirement_text, evidence_text):
         stable_input = json.dumps({
-            "requirement": requirement_text,
-            "evidence": evidence_text,
+            "requirement": " ".join((requirement_text or "").split()),
+            "evidence": " ".join((evidence_text or "").split()),
             "model": MODEL_NAME,
             "configuration": RELEVANCE_CONFIG_VERSION,
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -394,6 +396,14 @@ class RequirementEvidenceMatcher:
             else:
                 pending_indices.append(index)
                 pending_texts.append(text)
+
+        memo_hits = len(texts) - len(pending_texts)
+        if memo_hits:
+            print(
+                "Evidence match memo_hits="
+                f"{memo_hits} pending={len(pending_texts)}",
+                flush=True,
+            )
 
         if not pending_texts:
             return results

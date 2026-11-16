@@ -104,7 +104,7 @@ def test_relevance_batch_env_helpers_read_at_call_time(monkeypatch):
     monkeypatch.delenv("OLLAMA_RELEVANCE_BATCH_TIMEOUT", raising=False)
     monkeypatch.delenv("OLLAMA_RELEVANCE_BATCH_MAX_PAIRS", raising=False)
     assert ollama_client.relevance_batch_timeout_seconds() == 120
-    assert ollama_client.relevance_batch_max_pairs() == 0
+    assert ollama_client.relevance_batch_max_pairs() == 4
     monkeypatch.setenv("OLLAMA_RELEVANCE_BATCH_TIMEOUT", "45")
     monkeypatch.setenv("OLLAMA_RELEVANCE_BATCH_MAX_PAIRS", "3")
     assert ollama_client.relevance_batch_timeout_seconds() == 45

@@ -5,6 +5,19 @@ infers or fills in business data: missing values stay missing.
 """
 
 APPROVED = "APPROVED"
+DRAFT_PENDING_REVIEW_LABEL = "DRAFT — PENDING REVIEW"
+MISSING_DRAFT_CONTENT = (
+    "No generated content is available for this section. "
+    "This export does not invent a bid response."
+)
+MISSING_DRAFT_SECTION = (
+    "This section was not generated. The model output was missing, "
+    "truncated, or failed validation. This export does not invent a bid response."
+)
+NO_DRAFT_SECTIONS = (
+    "No AI draft sections are present in this snapshot. "
+    "This export does not invent bid-response content."
+)
 # The only human compliance decisions (PROPOSED; Java to confirm). Matching is
 # trimmed and case-insensitive; anything else (missing, null, PENDING, TBD,
 # N/A, UNKNOWN, "PARTIALLY COMPLIANT", ...) means no decision.
@@ -98,6 +111,9 @@ def normalize_snapshot(snapshot):
         for index, item in enumerate(requirements)
     ]
     normalized["actions"] = _optional_list_of_dicts(snapshot, "actions", "snapshot")
+    normalized["recommendations"] = _optional_list_of_dicts(
+        snapshot, "recommendations", "snapshot"
+    )
     normalized["draftSections"] = _optional_list_of_dicts(
         snapshot, "draftSections", "snapshot"
     )
@@ -144,3 +160,189 @@ def is_approved_section(section):
     """Only an explicit approvalStatus of APPROVED (any case) qualifies."""
     status = section.get("approvalStatus") if isinstance(section, dict) else None
     return isinstance(status, str) and status.strip().upper() == APPROVED
+
+
+def ordered_draft_sections(sections):
+    """Snapshot draft sections in explicit ``order``, then input order."""
+    indexed = [
+        (index, section)
+        for index, section in enumerate(sections or [])
+        if isinstance(section, dict)
+    ]
+    indexed.sort(
+        key=lambda pair: (
+            pair[1].get("order") is None,
+            pair[1].get("order") if pair[1].get("order") is not None else 0,
+            pair[0],
+        )
+    )
+    return [section for _, section in indexed]
+
+
+def pending_review_sections(sections):
+    """Unapproved draft sections. Never treated as a final bid response."""
+    return [
+        section
+        for section in ordered_draft_sections(sections)
+        if not is_approved_section(section)
+    ]
+
+
+def draft_review_status_label(section):
+    """Visible review label. Unapproved sections are never shown as APPROVED."""
+    if is_approved_section(section):
+        return APPROVED
+    return DRAFT_PENDING_REVIEW_LABEL
+
+
+def draft_requirement_ids_text(section):
+    ids = []
+    seen = set()
+    for item in section.get("sourceRequirementIds") or []:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text and text not in seen:
+            seen.add(text)
+            ids.append(text)
+    return ", ".join(ids)
+
+
+def draft_source_references_text(section):
+    citations = []
+    seen = set()
+    for source in section.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        filename = source.get("filename")
+        filename = filename.strip() if isinstance(filename, str) else ""
+        page = source.get("page")
+        page_text = str(page).strip() if page is not None else ""
+        clause = source.get("clause")
+        clause = clause.strip() if isinstance(clause, str) else ""
+        parts = []
+        if filename:
+            parts.append(filename)
+        if page_text:
+            parts.append(f"p.{page_text}")
+        if clause:
+            parts.append(f"clause {clause}")
+        bit = ", ".join(parts)
+        if bit and bit not in seen:
+            seen.add(bit)
+            citations.append(bit)
+    return "; ".join(citations)
+
+
+def draft_missing_information_text(section):
+    gaps = []
+    seen = set()
+    for item in section.get("missingInformation") or []:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text and text not in seen:
+            seen.add(text)
+            gaps.append(text)
+    return "; ".join(gaps)
+
+
+def draft_reviewer_comments_text(section):
+    """Copy reviewer comments from the snapshot only. Never invent them."""
+    for key in ("reviewerComments", "comments", "comment"):
+        value = section.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def draft_generated_content(section):
+    content = section.get("content") if isinstance(section, dict) else None
+    if isinstance(content, str) and content.strip():
+        return content
+    return MISSING_DRAFT_CONTENT
+
+
+def expected_draft_specs():
+    from app.drafting.generator import SECTION_SPECS
+    return SECTION_SPECS
+
+
+def _draft_identity_keys(section):
+    keys = set()
+    section_type = section.get("sectionType")
+    if isinstance(section_type, str) and section_type.strip():
+        keys.add(section_type.strip())
+    title = section.get("title")
+    if isinstance(title, str) and title.strip():
+        keys.add(title.strip())
+    return keys
+
+
+def missing_expected_draft_specs(sections):
+    """Expected bid-response types with no snapshot row (failed or omitted)."""
+    specs = expected_draft_specs()
+    known_types = {item[0] for item in specs}
+    known_titles = {item[1] for item in specs}
+    uses_expected_types = False
+    present = set()
+    for section in sections or []:
+        if not isinstance(section, dict):
+            continue
+        keys = _draft_identity_keys(section)
+        present.update(keys)
+        if keys & known_types or keys & known_titles:
+            uses_expected_types = True
+    if not uses_expected_types:
+        return []
+    missing = []
+    for section_type, title, order in specs:
+        if section_type in present or title in present:
+            continue
+        missing.append((section_type, title, order))
+    return missing
+
+
+SOURCE_VALIDATION_INCOMPLETE = "incomplete"
+SOURCE_VALIDATION_COMPLETE = "complete"
+SOURCE_VALIDATION_UNKNOWN = "unknown"
+ACTUAL_PDF_PAGE = "actual_pdf_page"
+DEMO_PENDING_SOURCE_VALIDATION = (
+    "Demonstration — pending source validation. "
+    "Some source page references are approximate document boundaries, "
+    "not verified PDF page numbers. Do not treat page numbers as final."
+)
+
+
+def source_page_reference_types(snapshot):
+    """Collect page_reference_type values already present on sources."""
+    types = []
+    for requirement in snapshot.get("requirements") or []:
+        if not isinstance(requirement, dict):
+            continue
+        for source in requirement.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            value = source.get("pageReferenceType")
+            if value is None:
+                value = source.get("page_reference_type")
+            if isinstance(value, str) and value.strip():
+                types.append(value.strip())
+    return types
+
+
+def source_validation_status(snapshot):
+    """complete / incomplete / unknown from existing source fields only."""
+    types = source_page_reference_types(snapshot)
+    if not types:
+        return SOURCE_VALIDATION_UNKNOWN
+    if all(value == ACTUAL_PDF_PAGE for value in types):
+        return SOURCE_VALIDATION_COMPLETE
+    return SOURCE_VALIDATION_INCOMPLETE
+
+
+def source_validation_banner(snapshot):
+    """Human-readable notice when source verification is incomplete, else None."""
+    if source_validation_status(snapshot) == SOURCE_VALIDATION_INCOMPLETE:
+        return DEMO_PENDING_SOURCE_VALIDATION
+    return None

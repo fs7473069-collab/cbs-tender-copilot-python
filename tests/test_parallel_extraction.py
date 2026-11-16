@@ -180,9 +180,9 @@ def test_sequential_mode_never_overlaps(setup_document):
     assert state["threads"] == {threading.main_thread().name}
 
 
-def test_default_workers_is_two(monkeypatch):
+def test_default_workers_is_one(monkeypatch):
     monkeypatch.delenv(service.EXTRACT_MAX_WORKERS_ENV, raising=False)
-    assert service.extract_max_workers() == 2
+    assert service.extract_max_workers() == 1
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "two"])

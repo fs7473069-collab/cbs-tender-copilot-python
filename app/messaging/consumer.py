@@ -10,12 +10,16 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from pika.exceptions import AMQPChannelError, AMQPConnectionError, AMQPError
 
+from app.drafting.generator import generate_draft_sections, merge_preserved_drafts
 from app.export.local_export import (
     LocalExportError,
     attach_export_files,
     upload_analysis_exports,
 )
-from app.messaging.rabbitmq import create_connection
+from app.messaging.rabbitmq import (
+    configured_analysis_request_queue,
+    create_connection,
+)
 from app.storage.s3_client import download_file
 from app.orchestration.service import process_tender_document
 from app.orchestration.tender_summary import summarize_tender_document
@@ -25,7 +29,7 @@ from app.messaging.publisher import publish_message
 
 load_dotenv()
 
-QUEUE = os.getenv("RABBITMQ_QUEUE", "rfp-python-test")
+QUEUE = configured_analysis_request_queue()
 DOWNLOAD_DIR = os.path.join("data", "s3_test")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEBUG_RESPONSE_PATH = (
@@ -106,10 +110,12 @@ def outbound_completion_payload(response):
     if not isinstance(response, dict):
         raise ValueError("Completed response must be an object")
     outbound = dict(response)
+    outbound.pop("draftSections", None)
     result = response.get("result")
     if isinstance(result, dict):
         result_copy = dict(result)
         result_copy.pop("requirements", None)
+        result_copy.pop("draftSections", None)
         outbound["result"] = result_copy
     return outbound
 
@@ -324,6 +330,22 @@ def process_delivery(body, redelivered):
         response_requirements = (
             (response.get("result") or {}).get("requirements") or []
         )
+        try:
+            generated = generate_draft_sections(
+                response.get("result"),
+                response_requirements,
+                message.get("documents"),
+            )
+            response["draftSections"] = merge_preserved_drafts(
+                generated,
+                response.get("draftSections"),
+            )
+        except Exception as exc:
+            print(
+                "DRAFT_SECTIONS skipped "
+                f"error_type={type(exc).__name__}",
+                flush=True,
+            )
         if len(response_requirements) != len(requirements):
             raise ValueError(
                 "Completed response requirement count does not match "
@@ -500,15 +522,16 @@ def _consume(state):
         channel = connection.channel()
         channel.basic_qos(prefetch_count=1)
 
+        request_queue = configured_analysis_request_queue()
         channel.basic_consume(
-            queue=QUEUE,
+            queue=request_queue,
             on_message_callback=lambda ch, method, properties, body: (
                 _start_delivery_worker(connection, ch, method, body, state)
             ),
             auto_ack=False,
         )
 
-        print(f"Connected. Waiting for messages from '{QUEUE}'...")
+        print(f"Connected. Waiting for messages from '{request_queue}'...")
         print("Press Ctrl+C to stop the consumer.")
 
         channel.start_consuming()

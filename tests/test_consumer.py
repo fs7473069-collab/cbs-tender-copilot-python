@@ -125,11 +125,16 @@ def test_successful_processing_acknowledges_request(
         "tender-export.docx",
     ]
     for item in completed["exportFiles"]:
-        assert set(item) == {"fileName", "downloadUrl"}
+        assert set(item) == {
+            "fileName", "downloadUrl", "bucket", "key", "expiresIn",
+        }
         assert item["downloadUrl"].startswith(
             "https://download.example.invalid/exports/"
         )
         assert item["downloadUrl"].endswith("/" + item["fileName"])
+        assert item["bucket"] == "analysis-export-bucket"
+        assert item["key"].endswith("/" + item["fileName"])
+        assert item["expiresIn"] == 345600
     assert completed["eventId"]
     datetime.fromisoformat(completed["completedAt"].replace("Z", "+00:00"))
     # Debug artifact keeps the full internal response, including requirements.
@@ -365,4 +370,38 @@ def test_closed_channel_does_not_acknowledge_or_reject():
 
     channel.basic_ack.assert_not_called()
     channel.basic_nack.assert_not_called()
+
+
+def test_mac_request_queue_env_is_used(monkeypatch):
+    monkeypatch.setenv("RABBITMQ_REQUEST_QUEUE", "copilot-analysis1")
+    monkeypatch.setenv("RABBITMQ_QUEUE", "copilot-analysis")
+    assert consumer.configured_analysis_request_queue() == "copilot-analysis1"
+
+
+def test_legacy_request_queue_env_is_used_when_mac_var_unset(monkeypatch):
+    monkeypatch.delenv("RABBITMQ_REQUEST_QUEUE", raising=False)
+    monkeypatch.setenv("RABBITMQ_QUEUE", "copilot-analysis")
+    assert consumer.configured_analysis_request_queue() == "copilot-analysis"
+
+
+def test_default_request_queue_when_no_env(monkeypatch):
+    monkeypatch.delenv("RABBITMQ_REQUEST_QUEUE", raising=False)
+    monkeypatch.delenv("RABBITMQ_QUEUE", raising=False)
+    assert consumer.configured_analysis_request_queue() == "rfp-python-test"
+
+
+def test_consumer_listens_on_configured_request_queue(monkeypatch):
+    monkeypatch.setenv("RABBITMQ_REQUEST_QUEUE", "copilot-analysis1")
+    connection = Mock()
+    connection.is_open = True
+    channel = Mock()
+    connection.channel.return_value = channel
+    monkeypatch.setattr(consumer, "create_connection", lambda: connection)
+
+    consumer._consume({"worker": None})
+
+    kwargs = channel.basic_consume.call_args.kwargs
+    assert kwargs["queue"] == "copilot-analysis1"
+    assert kwargs["auto_ack"] is False
+    channel.basic_qos.assert_called_once_with(prefetch_count=1)
 

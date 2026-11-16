@@ -105,7 +105,7 @@ def test_renderers_accept_every_invalid_character():
     assert "Requirement" in values
     assert workbook["Actions"]["C2"].value == "'=Act"
     text = [p.text for p in Document(BytesIO(render_word(snapshot))).paragraphs]
-    assert text[0] == "Title"
+    assert "Title" in text
     assert "Sec" in text and "Paragraph" in text
 
 

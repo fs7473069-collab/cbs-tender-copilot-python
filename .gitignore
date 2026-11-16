@@ -48,9 +48,14 @@ request.json
 response.json
 test_saved_response.py
 
-# Locally generated analysis data
+# Local runtime data (KB index, caches, documents, reports, ledgers, catalogs)
 /local_data/*
 !/local_data/.gitkeep
 
-# Generated diagnostic output
+# Generated diagnostic results
+diagnostics/*_results.json
+diagnostics/benchmark_representative_run/
 diagnostics/e2e_new_tender_metrics.json
+
+# macOS
+.DS_Store

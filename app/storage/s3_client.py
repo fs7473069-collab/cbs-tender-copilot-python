@@ -70,6 +70,12 @@ def create_presigned_download_url(bucket, key, expires_in):
 
     Does not set a canned ACL, public-read, or object ACL. The bucket stays
     private; the URL is the only access, and only until it expires.
+
+    AWS SigV4 allows at most 7 days (604800 seconds) when signing with IAM
+    user access keys. This client uses S3_ACCESS_KEY_ID and
+    S3_SECRET_ACCESS_KEY and does not send a session token. If those values
+    are temporary STS credentials, S3 will reject the URL when the session
+    ends, which can be far sooner than expires_in.
     """
     if not bucket or not key:
         raise ValueError("S3 bucket and key are required for a download URL")

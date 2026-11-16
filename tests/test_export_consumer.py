@@ -6,7 +6,11 @@ from io import BytesIO
 from unittest.mock import MagicMock, Mock
 
 import pytest
+from docx import Document
 from openpyxl import load_workbook
+
+from app.export.snapshot import DRAFT_PENDING_REVIEW_LABEL
+from app.export.word import PENDING_DRAFTS_HEADING
 
 import app.messaging.consumer as analysis_consumer
 import app.messaging.export_consumer as export_consumer
@@ -85,7 +89,29 @@ def test_successful_export_uploads_both_and_publishes_completed(io_mocks):
     assert io_mocks["uploads"][0]["contentType"] == export_consumer.XLSX_CONTENT_TYPE
     assert io_mocks["uploads"][1]["contentType"] == export_consumer.DOCX_CONTENT_TYPE
     workbook = load_workbook(BytesIO(io_mocks["uploads"][0]["data"]))
-    assert workbook.sheetnames == ["Requirements", "Compliance Matrix", "Actions"]
+    assert workbook.sheetnames == [
+        "Tender Overview",
+        "Requirements",
+        "Compliance Matrix",
+        "Actions",
+        "AI Draft Responses",
+    ]
+    drafts = workbook["AI Draft Responses"]
+    draft_headers = [cell.value for cell in drafts[1]]
+    draft_rows = [
+        dict(zip(draft_headers, [cell.value for cell in row]))
+        for row in drafts.iter_rows(min_row=2)
+    ]
+    by_title = {row["Title"]: row for row in draft_rows}
+    assert by_title["Draft"]["Generated Content"] == "DRAFT TEXT"
+    assert by_title["Draft"]["Review Status"] == DRAFT_PENDING_REVIEW_LABEL
+    assert by_title["First"]["Review Status"] == "APPROVED"
+    word = Document(BytesIO(io_mocks["uploads"][1]["data"]))
+    word_text = "\n".join(p.text for p in word.paragraphs)
+    pending_at = word_text.index(PENDING_DRAFTS_HEADING)
+    assert "DRAFT TEXT" in word_text[pending_at:]
+    assert "DRAFT TEXT" not in word_text[:pending_at]
+    assert "B para" in word_text[:pending_at]
 
     io_mocks["publish"].assert_called_once()
     event, queue = io_mocks["publish"].call_args.args
@@ -102,6 +128,17 @@ def test_successful_export_uploads_both_and_publishes_completed(io_mocks):
     assert event["counts"] == {"requirements": 3, "actions": 1}
     assert "url" not in json.dumps(event["artifacts"]).lower()
     ch.basic_ack.assert_called_once_with(delivery_tag=1)
+
+
+def test_snapshot_hash_includes_render_version():
+    request = make_export_request()
+    original = export_consumer.snapshot_sha256(request)
+    previous = export_consumer.EXPORT_RENDER_VERSION
+    export_consumer.EXPORT_RENDER_VERSION = previous + "-next"
+    try:
+        assert export_consumer.snapshot_sha256(request) != original
+    finally:
+        export_consumer.EXPORT_RENDER_VERSION = previous
 
 
 def test_key_prefix_from_request_is_sanitised(io_mocks):
@@ -484,8 +521,16 @@ def test_startup_refuses_export_queue_equal_to_analysis_queue_before_connecting(
 
 
 def test_startup_uses_analysis_default_queue_when_env_unset(monkeypatch):
+    monkeypatch.delenv("RABBITMQ_REQUEST_QUEUE", raising=False)
     monkeypatch.delenv("RABBITMQ_QUEUE", raising=False)
     monkeypatch.setattr(export_consumer, "REQUEST_QUEUE", "rfp-python-test")
+    assert export_consumer.start_export_consumer() == export_consumer.EXIT_CONFIGURATION_ERROR
+
+
+def test_startup_refuses_export_queue_equal_to_mac_analysis_request_queue(monkeypatch):
+    monkeypatch.setenv("RABBITMQ_REQUEST_QUEUE", "copilot-analysis1")
+    monkeypatch.setenv("RABBITMQ_QUEUE", "copilot-analysis")
+    monkeypatch.setattr(export_consumer, "REQUEST_QUEUE", "copilot-analysis1")
     assert export_consumer.start_export_consumer() == export_consumer.EXIT_CONFIGURATION_ERROR
 
 

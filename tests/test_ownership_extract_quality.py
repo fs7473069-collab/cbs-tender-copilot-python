@@ -22,7 +22,11 @@ TWO_RUN_PATH = (
 
 def test_extract_prompt_requires_preserving_every_option_column(monkeypatch):
     """Controlled prompt experiment: matrix rows must keep all option assignments."""
-    from app.llm.ollama_client import extract_requirements
+    from app.llm.ollama_client import (
+        EXTRACT_NUM_PREDICT,
+        extract_num_predict_for_text,
+        extract_requirements,
+    )
 
     captured = {}
 
@@ -32,13 +36,14 @@ def test_extract_prompt_requires_preserving_every_option_column(monkeypatch):
         return json.dumps({"requirements": []})
 
     monkeypatch.setattr("app.llm.ollama_client.generate_response", fake_generate)
-    extract_requirements({
-        "text": "Priority: M The vendor shall provide SSO for administrators.",
-    })
+    text = "Priority: M The vendor shall provide SSO for administrators."
+    extract_requirements({"text": text})
     prompt = captured["prompt"]
     assert "every option present in that row" in prompt.casefold()
     assert "do not stop after summarizing only some columns" in prompt.casefold()
-    assert captured["num_predict"] == 1536
+    assert EXTRACT_NUM_PREDICT == 1536
+    assert captured["num_predict"] == extract_num_predict_for_text(text)
+    assert captured["num_predict"] <= EXTRACT_NUM_PREDICT
 
 
 def test_fixture_pricing_row_contains_all_three_option_assignments():

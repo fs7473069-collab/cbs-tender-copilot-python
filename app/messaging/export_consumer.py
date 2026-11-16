@@ -37,7 +37,11 @@ from app.export import (
 )
 from app.messaging.publisher import RESPONSE_QUEUE as ANALYSIS_RESPONSE_QUEUE
 from app.messaging.publisher import publish_to_queue
-from app.messaging.rabbitmq import create_connection
+from app.messaging.rabbitmq import (
+    ANALYSIS_REQUEST_QUEUE_LEGACY_ENV,
+    configured_analysis_request_queue,
+    create_connection,
+)
 from app.storage.s3_client import upload_bytes
 
 try:
@@ -51,14 +55,16 @@ EXPORT_REQUESTED = "RFP_EXPORT_REQUESTED"
 EXPORT_COMPLETED = "RFP_EXPORT_COMPLETED"
 EXPORT_FAILED = "RFP_EXPORT_FAILED"
 SCHEMA_VERSION = "1.0"
+# Bump when Excel/Word layout changes so a regenerated export with the same
+# Java snapshot re-renders instead of reusing ledger artifacts.
+EXPORT_RENDER_VERSION = "draft-responses-v1"
 
 REQUEST_QUEUE = os.getenv("RABBITMQ_EXPORT_REQUEST_QUEUE", "rfp-export-requests")
 RESPONSE_QUEUE = os.getenv(
     "RABBITMQ_EXPORT_RESPONSE_QUEUE", "rfp-export-responses"
 )
 # Must match the fallback in app.messaging.consumer.
-ANALYSIS_REQUEST_QUEUE_ENV = "RABBITMQ_QUEUE"
-ANALYSIS_REQUEST_QUEUE_DEFAULT = "rfp-python-test"
+# Analysis request queue names live in app.messaging.rabbitmq.
 
 EXPORT_BUCKET_ENV = "S3_EXPORT_BUCKET"
 FALLBACK_BUCKET_ENV = "S3_BUCKET"
@@ -177,8 +183,10 @@ def validate_queue_configuration(
     )
     others = [
         ("RABBITMQ_EXPORT_RESPONSE_QUEUE", response_queue.strip()),
-        (f"{ANALYSIS_REQUEST_QUEUE_ENV} (analysis request queue)",
-         (analysis_request_queue or "").strip()),
+        (
+            f"{ANALYSIS_REQUEST_QUEUE_LEGACY_ENV} (analysis request queue)",
+            (analysis_request_queue or "").strip(),
+        ),
         ("analysis response queue", (analysis_response_queue or "").strip()),
     ]
     problems = []
@@ -191,7 +199,7 @@ def validate_queue_configuration(
 
 
 def _configured_analysis_request_queue():
-    return os.getenv(ANALYSIS_REQUEST_QUEUE_ENV, ANALYSIS_REQUEST_QUEUE_DEFAULT)
+    return configured_analysis_request_queue()
 
 
 def requeue_delay_seconds():
@@ -316,7 +324,12 @@ def resolve_bucket(message):
 
 def snapshot_sha256(message):
     canonical = json.dumps(
-        message.get("snapshot"), sort_keys=True, ensure_ascii=False
+        {
+            "renderVersion": EXPORT_RENDER_VERSION,
+            "snapshot": message.get("snapshot"),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
     ).encode("utf-8", "surrogatepass")
     return hashlib.sha256(canonical).hexdigest()
 

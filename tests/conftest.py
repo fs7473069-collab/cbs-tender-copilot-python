@@ -7,6 +7,27 @@ download URL is ``https://download.example.invalid/{key}``.
 
 import pytest
 
+from app.llm.ollama_client import clear_extract_requirements_cache
+
+
+@pytest.fixture(autouse=True)
+def mock_analysis_bid_drafts(monkeypatch):
+    """Consumer drafting is mocked; unit tests call the generator directly."""
+    monkeypatch.setattr(
+        "app.messaging.consumer.generate_draft_sections",
+        lambda *args, **kwargs: [],
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_extract_disk_cache(tmp_path, monkeypatch):
+    """Do not write extraction JSON into the shared knowledge-base directory."""
+    monkeypatch.setenv(
+        "TENDER_EXTRACT_CACHE_PATH",
+        str(tmp_path / "extract_cache.json"),
+    )
+    clear_extract_requirements_cache()
+
 
 @pytest.fixture(autouse=True)
 def mock_analysis_export_s3(monkeypatch):

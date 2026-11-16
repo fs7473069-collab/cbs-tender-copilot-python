@@ -602,15 +602,17 @@ def test_published_schema_key_sets_are_unchanged():
                 "fileName": "tender-export.xlsx",
                 "downloadUrl": "https://download.example.invalid/tender-export.xlsx",
                 "path": "/proposed/tender-export.xlsx",
-                "bucket": "should-not-appear",
-                "key": "should-not-appear",
+                "bucket": "export-bucket",
+                "key": "exports/org/ws/job/analysis/tender-export.xlsx",
+                "expiresIn": 345600,
             },
             {
                 "fileName": "tender-export.docx",
                 "downloadUrl": "https://download.example.invalid/tender-export.docx",
                 "path": "/proposed/tender-export.docx",
-                "bucket": "should-not-appear",
-                "key": "should-not-appear",
+                "bucket": "export-bucket",
+                "key": "exports/org/ws/job/analysis/tender-export.docx",
+                "expiresIn": 345600,
             },
         ],
     )
@@ -620,7 +622,12 @@ def test_published_schema_key_sets_are_unchanged():
         "tender-export.docx",
     ]
     for item in published["exportFiles"]:
-        assert set(item) == {"fileName", "downloadUrl"}
+        assert set(item) == {
+            "fileName", "downloadUrl", "bucket", "key", "expiresIn",
+        }
+        assert "path" not in item
+        assert item["bucket"] == "export-bucket"
+        assert item["expiresIn"] == 345600
     for key in TOP_LEVEL_KEYS:
         assert published[key] == response[key]
     outbound = outbound_completion_payload(published)

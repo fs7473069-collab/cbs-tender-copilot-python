@@ -1,10 +1,12 @@
 
 import copy
+import hashlib
 import json
 import os
 import re
 import threading
 import time
+from pathlib import Path
 
 import requests
 
@@ -31,7 +33,7 @@ OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "0"))
 # Documented production defaults (unchanged). Live values are read at call time
 # via relevance_batch_* helpers so process env is honored after import.
 RELEVANCE_BATCH_TIMEOUT_DEFAULT = 120
-RELEVANCE_BATCH_MAX_PAIRS_DEFAULT = 0
+RELEVANCE_BATCH_MAX_PAIRS_DEFAULT = 4
 # Backward-compatible aliases (import-time snapshot; prefer helpers in new code).
 RELEVANCE_BATCH_TIMEOUT = int(
     os.getenv(
@@ -67,7 +69,8 @@ def relevance_batch_max_pairs():
     """Optional max pairs per batch generate; 0 means no split.
 
     Reads ``OLLAMA_RELEVANCE_BATCH_MAX_PAIRS`` at call time. Production default
-    is 0 (single batch for the full round).
+    is 4 so a large round cannot become one oversized generate. 0 keeps a
+    single batch for the full round.
     """
     raw = os.getenv("OLLAMA_RELEVANCE_BATCH_MAX_PAIRS")
     if raw is None or raw.strip() == "":
@@ -108,12 +111,15 @@ _SKIP_BLANK_PAGE = re.compile(
 _SKIP_TOC_DOTTED = re.compile(r"\.{3,}\s*\d+\b")
 _TOC_DOTTED_MIN_HITS = 3
 
-# Reuse extraction JSON for identical chunk text within one process (same tender
-# often repeats banners). Bounded to avoid unbounded growth on long consumers.
+# Reuse extraction JSON for identical chunk text. Memory is bounded; disk
+# survives process restart. Key includes model + extraction prompt version.
 _EXTRACT_RESULT_CACHE = {}
-_EXTRACT_RESULT_CACHE_MAX = 256
+_EXTRACT_RESULT_CACHE_MAX = 1024
+_EXTRACT_DISK_CACHE_MAX = 2048
+EXTRACT_CACHE_ENV = "TENDER_EXTRACT_CACHE_PATH"
 # Chunk extraction may run in worker threads; guards cache reads and writes.
 _EXTRACT_RESULT_CACHE_LOCK = threading.Lock()
+_EXTRACT_DISK_CACHE_PATH_LOADED = None
 
 # Last /api/generate metrics (done_reason, response_chars) for batch diagnostics.
 # Thread-local so concurrent generates never overwrite each other's metrics.
@@ -131,10 +137,119 @@ def _clear_last_generate_metrics():
     _GENERATE_METRICS_LOCAL.metrics = {}
 
 
-def clear_extract_requirements_cache():
-    """Clear the in-process identical-chunk extraction cache (tests/helpers)."""
+def extract_cache_path():
+    """Disk file for extraction JSON. Override with TENDER_EXTRACT_CACHE_PATH."""
+    raw = os.getenv(EXTRACT_CACHE_ENV)
+    if raw is not None and str(raw).strip():
+        return Path(str(raw).strip())
+    return (
+        Path(__file__).resolve().parents[2]
+        / "local_data"
+        / "cbs_knowledge_base"
+        / "extract_cache.json"
+    )
+
+
+def _extract_cache_key(tender_text):
+    stable = json.dumps(
+        {
+            "model": MODEL_NAME,
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "text": normalize_chunk_text(tender_text),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def extract_num_predict_for_text(text):
+    """Bound extract decode. Short chunks still get at least 512 tokens."""
+    cap = EXTRACT_NUM_PREDICT
+    chars = len(text or "")
+    return min(cap, max(512, 256 + chars // 2))
+
+
+def _hydrate_extract_disk_cache():
+    """Load durable extraction JSON into memory when the cache path changes."""
+    global _EXTRACT_DISK_CACHE_PATH_LOADED
+    path = extract_cache_path()
+    path_s = str(path)
+    if _EXTRACT_DISK_CACHE_PATH_LOADED == path_s:
+        return
+    loaded = {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    if (
+        isinstance(raw, dict)
+        and raw.get("prompt_version") == EXTRACTION_PROMPT_VERSION
+        and raw.get("model") == MODEL_NAME
+        and isinstance(raw.get("entries"), dict)
+    ):
+        for key, value in raw["entries"].items():
+            if isinstance(value, dict) and isinstance(value.get("requirements"), list):
+                loaded[key] = copy.deepcopy(value)
     with _EXTRACT_RESULT_CACHE_LOCK:
         _EXTRACT_RESULT_CACHE.clear()
+        _EXTRACT_RESULT_CACHE.update(loaded)
+        _EXTRACT_DISK_CACHE_PATH_LOADED = path_s
+
+
+def _persist_extract_disk_entry(cache_key, result):
+    path = extract_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    with _EXTRACT_RESULT_CACHE_LOCK:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        if (
+            not isinstance(raw, dict)
+            or raw.get("prompt_version") != EXTRACTION_PROMPT_VERSION
+            or raw.get("model") != MODEL_NAME
+            or not isinstance(raw.get("entries"), dict)
+        ):
+            raw = {
+                "model": MODEL_NAME,
+                "prompt_version": EXTRACTION_PROMPT_VERSION,
+                "entries": {},
+            }
+        entries = raw["entries"]
+        entries[cache_key] = copy.deepcopy(result)
+        while len(entries) > _EXTRACT_DISK_CACHE_MAX:
+            entries.pop(next(iter(entries)))
+        payload = {
+            "model": MODEL_NAME,
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "entries": entries,
+        }
+        temporary = path.parent / (
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            temporary.replace(path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                return
+
+
+def clear_extract_requirements_cache():
+    """Clear the in-process identical-chunk extraction cache (tests/helpers)."""
+    global _EXTRACT_DISK_CACHE_PATH_LOADED
+    with _EXTRACT_RESULT_CACHE_LOCK:
+        _EXTRACT_RESULT_CACHE.clear()
+        _EXTRACT_DISK_CACHE_PATH_LOADED = None
 
 
 def clear_batch_diagnostic_events():
@@ -151,6 +266,15 @@ def normalize_chunk_text(text):
     return " ".join((text or "").split())
 
 
+def _table_headers_only(text):
+    """True when a packed table chunk has a header line and no body rows."""
+    stripped = (text or "").strip()
+    if not stripped.lower().startswith("table headers:"):
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    return len(lines) <= 1
+
+
 def chunk_extraction_decision(text):
     """Decide whether extract_requirements should call the LLM.
 
@@ -161,6 +285,9 @@ def chunk_extraction_decision(text):
     """
     if not isinstance(text, str) or not text.strip():
         return False, "empty_text"
+
+    if _table_headers_only(text):
+        return False, "table_headers_only"
 
     normalized = normalize_chunk_text(text)
     if _REQUIREMENT_SIGNAL.search(normalized):
@@ -287,7 +414,8 @@ def extract_requirements(chunk):
         )
         return {"requirements": []}
 
-    cache_key = normalize_chunk_text(tender_text)
+    _hydrate_extract_disk_cache()
+    cache_key = _extract_cache_key(tender_text)
     with _EXTRACT_RESULT_CACHE_LOCK:
         cached = _EXTRACT_RESULT_CACHE.get(cache_key)
         if cached is not None:
@@ -296,7 +424,7 @@ def extract_requirements(chunk):
         print(
             "OLLAMA_GENERATE skipped extract_requirements "
             f"reason=duplicate_chunk_text cache=1 "
-            f"chars={len(cache_key)}",
+            f"chars={len(normalize_chunk_text(tender_text))}",
             flush=True,
         )
         return cached
@@ -376,7 +504,7 @@ TENDER TEXT:
 
     response_text = generate_response(
         prompt,
-        num_predict=EXTRACT_NUM_PREDICT,
+        num_predict=extract_num_predict_for_text(tender_text),
         label="extract_requirements",
     )
 
@@ -465,6 +593,7 @@ TENDER TEXT:
             # Drop an arbitrary old entry; exact LRU is unnecessary for this cache.
             _EXTRACT_RESULT_CACHE.pop(next(iter(_EXTRACT_RESULT_CACHE)))
         _EXTRACT_RESULT_CACHE[cache_key] = copy.deepcopy(result)
+    _persist_extract_disk_entry(cache_key, result)
     return result
 
 
@@ -976,7 +1105,7 @@ def assess_evidence_relevance_batch(pairs):
     if not pairs:
         return []
 
-    # Optional benchmark/ops split; production default 0 keeps one batch call.
+    # Production default max_pairs=4. 0 keeps one batch for the round.
     max_pairs = relevance_batch_max_pairs()
     if max_pairs > 0 and len(pairs) > max_pairs:
         print(
